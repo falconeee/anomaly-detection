@@ -23,7 +23,7 @@ class AttributeMatrixGenerator:
     def fit_scaler(self, train_dataframes):
         if isinstance(train_dataframes, pd.DataFrame):
             train_dataframes = [train_dataframes]
-        # Concatena para calcular estatísticas globais
+        # Concat to calculate global statistics
         full_train_df = pd.concat(train_dataframes, ignore_index=True)
         self.mean = full_train_df.mean()
         self.std = full_train_df.std() + 1e-6
@@ -32,7 +32,7 @@ class AttributeMatrixGenerator:
         if self.mean is None:
             raise ValueError("Execute .fit_scaler() primeiro.")
 
-        # Normalização
+        # Scaling
         data = (df - self.mean) / self.std
         values = np.nan_to_num(data.values)
         
@@ -40,13 +40,13 @@ class AttributeMatrixGenerator:
         target_values = [] 
 
         if len(values) < self.w:
-            # Retorna tupla vazia se df for muito pequeno (i.e menor que window_size)
+            # Return empty tuple if df is too small (i.e. smaller than window_size)
             return torch.empty(0), torch.empty(0)
 
         for t in range(self.w, len(values), self.step):
             x_segment = values[t-self.w : t] 
             
-            # Matriz (Eq. 1)
+            # Matrix (Eq. 1)
             x_t = torch.tensor(x_segment, dtype=torch.float32).T
             m_t = torch.matmul(x_t, x_t.T) / self.w
             matrices.append(m_t)
@@ -57,13 +57,13 @@ class AttributeMatrixGenerator:
         if not matrices:
             return torch.empty(0), torch.empty(0)
 
-        # Tuple: (Tensor das Matrizes, Tensor dos Valores)
+        # Tuple: (Tensor of Matrices, Tensor of Values)
         return torch.stack(matrices).unsqueeze(1), torch.stack(target_values)
 
 class TemporalAttention(nn.Module):
     def __init__(self, hidden_dim):
         super(TemporalAttention, self).__init__()
-        self.scale = 5.0 # Mecanismo de atenção (quantas janelas o algoritmo olha para realizar a predição atual)
+        self.scale = 5.0 # Attention mechanism (how many windows the algorithm looks at to perform the current prediction)
 
     def forward(self, h_current, h_history):
         if not h_history:
@@ -128,14 +128,14 @@ class MSCVAE_Hybrid(nn.Module):
             self.flatten_dim = out.view(1, -1).size(1)
             self.spatial_shape = out.shape[1:] 
 
-        # Latente
+        # Latent
         self.fc_mu = nn.Linear(self.flatten_dim, latent_dim)
         self.fc_logvar = nn.Linear(self.flatten_dim, latent_dim)
         
-        # Decoder Matriz
+        # Decoder Matrix
         self.fc_decode_mat = nn.Linear(latent_dim, self.flatten_dim)
         
-        # Decoder de Valores (Híbrido)
+        # Decoder of Values (Hybrid)
         self.val_decoder = nn.Sequential(
             nn.Linear(latent_dim, 128),
             nn.ReLU(),
@@ -146,7 +146,7 @@ class MSCVAE_Hybrid(nn.Module):
         self.clstm = ConvLSTMCell(64, 64, kernel_size=3, bias=True)
         self.attention = TemporalAttention(hidden_dim=64)
         
-        # Decoder Convolucional
+        # Convolutional Decoder
         self.dec3 = nn.ConvTranspose2d(64, 32, 3, 2, 1, output_padding=1)
         self.dec2 = nn.ConvTranspose2d(32, 16, 3, 2, 1, output_padding=1)
         self.dec1 = nn.ConvTranspose2d(16, 1, 3, 2, 1, output_padding=1)
@@ -170,10 +170,10 @@ class MSCVAE_Hybrid(nn.Module):
         logvar = self.fc_logvar(flat)
         z = self.reparameterize(mu, logvar)
         
-        # Rota 1: Valores
+        # Route 1: Values
         recon_values = self.val_decoder(z)
         
-        # Rota 2: Matrizes
+        # Route 2: Matrices
         if self.h_state is None or self.h_state.size(0) != batch_size:
             h, w = self.spatial_shape[1], self.spatial_shape[2]
             self.h_state = torch.zeros(batch_size, 64, h, w).to(x.device)
