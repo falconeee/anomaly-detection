@@ -1,8 +1,6 @@
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import time
-import gc
 import math
 import random
 import os
@@ -13,7 +11,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
-# --- Helper Classes (Models & Utils) ---
+# Helper Classes (Models & Utils)
 def set_deterministic(seed=42):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -307,7 +305,7 @@ class SPOT:
         if gamma != 0: return self.init_threshold + (sigma / gamma) * (pow(r, -gamma) - 1)
         else: return self.init_threshold - sigma * math.log(r)
 
-# --- Main Class ---
+# Main Class
 class MSCRED:
     def __init__(self):
         self.model_config = {
@@ -396,7 +394,7 @@ class MSCRED:
         
         min_val, max_val = self.scaler_params
         data_values = df_source.values
-        # Normalize for regression target
+        # Scaling
         data_norm = (data_values - min_val.T) / (max_val.T - min_val.T + 1e-6)
         
         values_aligned = data_norm[start_index_real :: gap_time]
@@ -416,10 +414,10 @@ class MSCRED:
         if epochs is not None:
              self.model_config['epochs'] = epochs
 
-        # 1. Scaler
+        # Scaler
         self.scaler_params = self._get_scaler(df_train_list)
         
-        # 2. Generate Matrices
+        # Generate Matrices
         X_train_list = []
         for i, block in enumerate(df_train_list):
             X_proc = self._generate_signature_matrix(block)
@@ -431,11 +429,11 @@ class MSCRED:
             
         X_train_final = np.concatenate(X_train_list, axis=0)
         
-        # 3. Prepare Hybrid Data
+        # Prepare Hybrid Data
         df_train_full = pd.concat(df_train_list)
         X_train_hybrid, y_train_hybrid = self._prepare_hybrid_data(X_train_final, df_train_full)
         
-        # 4. Initialize Model
+        # Initialize Model
         sample_shape = X_train_hybrid.shape
         scale_n = sample_shape[2]
         self.sensor_n = sample_shape[3]
@@ -444,9 +442,9 @@ class MSCRED:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.model_config['learning_rate'])
         criterion = nn.MSELoss()
         
-        # 5. Train Loop
+        # Training
         dataset = HybridDataset(X_train_hybrid, y_train_hybrid)
-        dataloader = DataLoader(dataset, batch_size=self.model_config['batch_size'], shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=self.model_config['batch_size'], shuffle=True) # shuffle=True for training because too much superposition in batches
         
         self.model.train()
         print(f"Starting training for {self.model_config['epochs']} epochs...")
@@ -474,7 +472,7 @@ class MSCRED:
             
             print(f"Epoch {epoch+1}/{self.model_config['epochs']} | Loss: {epoch_loss/len(dataloader):.6f} | Time: {time.time() - start_time:.2f}s")
 
-        # 6. Calculate Threshold (POT)
+        # Calculate Threshold (POT)
         self.model.eval()
         train_scores = self._get_train_scores(X_train_hybrid, y_train_hybrid)
         self.threshold = self._pot_eval(train_scores) * self.gain
@@ -515,12 +513,6 @@ class MSCRED:
             
         X_test = self._generate_signature_matrix(df_test)
         
-        # Align y_test for validation (although predict usually doesn't need y, 
-        # the architecture might imply paired usage, but for pure anomaly detection 
-        # based on reconstruction error, we just need X input to get error)
-        # However, to reuse HybridDataset which expects (X, y), we create dummy y or aligned y.
-        # Let's create aligned y similar to train to be safe.
-        
         gap_time = self.model_config['gap_time']
         win_size = self.model_config['win_size']
         step_max = self.model_config['step_max']
@@ -535,15 +527,7 @@ class MSCRED:
         
         valid_timestamps = ts_values[start_index_real :: gap_time]
         
-        # Use existing prepare logic but we might not have y_test "labels" if it's purely unlabelled?
-        # Actually in anomaly detection we usually have the input data itself as target.
-        # So we proceed as in training.
-        
         X_test_final, _ = self._prepare_hybrid_data(X_test, df_test)
-        
-        # But we need to ensure X_test_final aligns with valid_timestamps.
-        # _prepare_hybrid_data cuts to min_len. 
-        # Let's ensure consistency.
         
         dataset = HybridDataset(X_test_final.astype(np.float32), np.zeros((len(X_test_final), self.sensor_n))) # Dummy targets
         loader = DataLoader(dataset, batch_size=self.model_config['batch_size'], shuffle=False)
@@ -573,7 +557,7 @@ class MSCRED:
             'scores': final_scores[:min_len]
         }
 
-    def contribution(self, df_test, timestamps=None):
+    def contribution(self, df_test, df_sistema):
         if self.model is None:
             raise ValueError("Model not trained.")
             
@@ -594,22 +578,16 @@ class MSCRED:
                 batch_x = batch_x.to(self.device)
                 recon_matrix, recon_vals = self.model(batch_x)
                 
-                # 1. Contribution Matrix Error
+                # Contribution Matrix Error
                 recon_np = recon_matrix.cpu().numpy()
                 gt_batch = batch_x.cpu().numpy()[:, -1, :, :, :]
                 diff = np.square(gt_batch - recon_np)
-                # Sum over batch and time (steps) is implicitly handled by aggregation later?
-                # Original code: mean over axis 1 (Time/Step?) -> No, axis=(1,2,3) in predict.
-                # In provided code: np.mean(diff, axis=1) where diff is (Batch, Scales, H, W)?? 
-                # Wait, shape is (Batch, Scales, H, W).
-                # Provided code says: diff_aggregated_scales = np.mean(diff, axis=1) -> (Batch, H, W)
-                # batch_total_error = np.sum(diff_aggregated_scales, axis=0) -> (H, W)
                 
                 diff_aggregated_scales = np.mean(diff, axis=1) # Average over scales
                 batch_total_error = np.sum(diff_aggregated_scales, axis=0) # Sum over batch samples
                 total_error_matrix += batch_total_error
                 
-                # 2. Value Reconstruction (for DataFrame return)
+                # Value Reconstruction
                 reconstructed_values_list.extend(recon_vals.cpu().numpy())
                 original_values_list.extend(batch_y.numpy())
                 
@@ -617,10 +595,24 @@ class MSCRED:
         sensor_scores = np.sum(total_error_matrix, axis=1)
         total_period_error = np.sum(sensor_scores)
         
-        contributions = {}
-        for idx, col in enumerate(df_test.columns):
-            contributions[col] = (sensor_scores[idx] / total_period_error) * 100
-            
+        # Create dataframe with variables and scores
+        df_contrib = pd.DataFrame({
+            'VARIAVEL': df_test.columns,
+            'score': sensor_scores,
+            '%': (sensor_scores / total_period_error) * 100
+        })
+        # Sort from highest to lowest contribution
+        df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
+        # Merge with df_sistema to bring descriptions
+        df_contrib = df_contrib.merge(df_sistema[['VARIAVEL', 'DESC']], on='VARIAVEL', how='left')
+        df_contrib.rename(columns={'DESCRIÇÃO': 'DESC'}, inplace=True)
+        # Handle cases where a variable may not have a description in df_sistema
+        df_contrib['DESC'] = df_contrib['DESC'].fillna('Descrição indisponível')
+        # Convert index to string to generate dictionary keys in text format ('0', '1', etc)
+        df_contrib.index = df_contrib.index.astype(str)
+        # Convert DataFrame to nested dictionary format
+        contributions = df_contrib[['VARIAVEL', 'DESC', 'score', '%']].to_dict(orient='dict')
+
         # Reconstruct DataFrame
         # Inverse transform
         min_val, max_val = self.scaler_params
@@ -629,13 +621,10 @@ class MSCRED:
         # (N, Sensors)
         recon_arr = np.array(reconstructed_values_list)
         
-        # Inverse
+        # Inverse transform
         # Val = Norm * (Max-Min) + Min
         recon_real = recon_arr * (max_val.T - min_val.T) + min_val.T
         
         df_reconstruction = pd.DataFrame(recon_real, columns=df_test.columns)
         
-        return {
-            'contributions': contributions,
-            'reconstruction': df_reconstruction
-        }
+        return contributions, df_reconstruction

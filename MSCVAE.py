@@ -3,16 +3,14 @@ import numpy as np
 import math
 import random
 import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
 
-# --- Helper Classes ---
-
+# Helper Classes
 class AttributeMatrixGenerator:
     def __init__(self, window_size=10, step=10):
         self.w = window_size
@@ -377,8 +375,7 @@ class SPOT:
         return {'thresholds': th, 'alarms': alarm}
 
 
-# --- Main Class ---
-
+# Main Class
 class MSCVAE:
     def __init__(self, n_features=None, window_size=10, stride=1, device=None, seed=42):
         self.seed = seed
@@ -396,7 +393,7 @@ class MSCVAE:
         self.model = None
         self.generator = AttributeMatrixGenerator(window_size=self.window_size, step=self.stride)
         self.threshold = None
-        self.gain = 1.0
+        self.gain = 1.0 # default gain
     
     def set_deterministic(self, seed=42):
         random.seed(seed)
@@ -414,11 +411,11 @@ class MSCVAE:
         if isinstance(train_data, pd.DataFrame):
             train_data = [train_data]
             
-        # 1. Fit scaler
+        # Fit scaler
         if verbose: print("Fitting scaler...")
         self.generator.fit_scaler(train_data)
         
-        # 2. Prepare data
+        # Prepare data
         if verbose: print("Generating training data...")
         train_matrices = []
         train_values = []
@@ -445,11 +442,11 @@ class MSCVAE:
             shuffle=True
         )
         
-        # 3. Initialize Model
+        # Initialize Model
         self.model = MSCVAE_Hybrid(n_features=self.n_features).to(self.device)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         
-        # 4. Train Loop
+        # Training
         self.model.train()
         if verbose: print(f"Starting training on {self.device} for {epochs} epochs...")
         
@@ -469,7 +466,7 @@ class MSCVAE:
             if verbose and (epoch + 1) % 5 == 0:
                 print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss / len(train_loader.dataset):.4f}")
 
-        # 5. Calculate Threshold (POT)
+        # Calculate Threshold (POT)
         if verbose: print("Calculating threshold...")
         train_scores = self._get_anomaly_scores(final_train_matrix)
         self.threshold = self._pot_eval(train_scores)
@@ -517,7 +514,7 @@ class MSCVAE:
     def predict(self, df_test, timestamps=None, batch_size=128):
         if self.model is None:
             raise ValueError("Model not trained. Call .fit() first.")
-            
+
         self.model.eval()
         
         # Generate data
@@ -571,13 +568,13 @@ class MSCVAE:
                 'scores': all_scores
             }
 
-    def contribution(self, df_test, batch_size=32):
+    def contribution(self, df_test, df_sistema, batch_size=32):
         if self.model is None:
             raise ValueError("Model not trained. Call .fit() first.")
         
         self.model.eval()
         
-        # 1. Generate data
+        # Generate data
         try:
             tensor_matrices, tensor_values = self.generator.generate(df_test)
         except ValueError as e:
@@ -586,9 +583,8 @@ class MSCVAE:
         if tensor_matrices.nelement() == 0:
              raise ValueError("No matrices generated from input dataframe.")
 
-        # 2. Loaders
-        # We need both matrices (for error calc) and values (for reconstruction calc)
-        # Note: tensor_values corresponds to the target value at the end of the window
+        # Loaders
+        # Need both matrices (for error calc) and values (for reconstruction calc)
         loader = DataLoader(TensorDataset(tensor_matrices, tensor_values), batch_size=batch_size, shuffle=False)
         
         n_features = tensor_matrices.shape[2]
@@ -608,7 +604,7 @@ class MSCVAE:
                 
                 recon_matrix, recon_val, _, _ = self.model(inputs)
                 
-                # --- Contribution Calculation ---
+                # Contribution Calculation
                 # Matrix Error: (B, N, N)
                 # squeeze(1) removes channel dim if present (B, 1, N, N) -> (B, N, N)
                 if inputs.dim() == 4:
@@ -619,11 +615,10 @@ class MSCVAE:
                     
                 total_error_matrix += torch.sum(batch_error, dim=0)
                 
-                # --- Reconstruction Storage ---
+                # Reconstruction Storage
                 original_vals.extend(vals.cpu().numpy())
                 reconstructed_vals.extend(recon_val.cpu().numpy())
 
-        # 3. Process Contributions
         variable_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
         variable_names = df_test.columns
         total_period_error = np.sum(variable_scores)
@@ -631,16 +626,29 @@ class MSCVAE:
         # Safe division
         contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
 
-        contributions_dict = {
-            'Variable': variable_names,
-            'Contribution %': contrib_pct
-        }
+        # Create temporary DataFrame with calculated scores
+        df_contrib = pd.DataFrame({
+            'VARIAVEL': variable_names,
+            'score': variable_scores,
+            '%': contrib_pct
+        })
         
-        # 4. Process Reconstructions
-        # Denormalize
-        orig_arr = np.array(original_vals)
+        # Merge with df_sistema to bring the DESC column
+        df_contrib = pd.merge(df_contrib, df_sistema[['VARIAVEL', 'DESC']], on='VARIAVEL', how='left')
+        # Fill in any nulls if a variable from df_test is not in df_sistema
+        df_contrib['DESC'] = df_contrib['DESC'].fillna('Sem descrição')
+        # Sort from highest contribution to lowest
+        df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
+        # Format for the nested dictionary (keys as strings '0', '1', '2'...)
+        df_contrib.index = df_contrib.index.astype(str)
+        # Reorganize the column order
+        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'score', '%']]
+        # Convert to the nested dictionary
+        contributions_dict = df_contrib.to_dict()
+
+        # Process Reconstructions
         recon_arr = np.array(reconstructed_vals)
-        
+
         # Create DataFrame with Original/Reconstructed columns
         recon_data = {}
         for i, col in enumerate(variable_names):
@@ -649,10 +657,6 @@ class MSCVAE:
             
             # Denormalize
             rec_real = (recon_arr[:, i] * std) + mean
-            
-            # We only return the Reconstruction as requested, 
-            # but it is often useful to compare with Original.
-            # The prompt asks for "dataframe contendo a reconstrução de todas as variáveis"
             recon_data[f"{col}"] = rec_real
             
         reconstruction_df = pd.DataFrame(recon_data)
