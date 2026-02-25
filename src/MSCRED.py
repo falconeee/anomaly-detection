@@ -557,7 +557,7 @@ class MSCRED:
             'scores': final_scores[:min_len]
         }
 
-    def contribution(self, df_test, df_sistema):
+def contribution(self, df_test, df_sistema):
         if self.model is None:
             raise ValueError("Model not trained.")
             
@@ -601,8 +601,19 @@ class MSCRED:
             'score': sensor_scores,
             '%': (sensor_scores / total_period_error) * 100
         })
+        
         # Sort from highest to lowest contribution
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
+        
+        # Calculate cumulative percentage
+        df_contrib['cum_perc'] = df_contrib['%'].cumsum()
+        # Condition 1: Keep variables until cumulative contribution reaches 80%
+        mask_cum_80 = df_contrib['cum_perc'].shift(fill_value=0) < 80
+        # Condition 2: Keep variables that contribute at least 5% individually
+        mask_min_5 = df_contrib['%'] >= 5
+        # Keep variables that satisfy either condition
+        df_contrib = df_contrib[mask_cum_80 | mask_min_5].drop(columns=['cum_perc']).reset_index(drop=True)
+
         # Merge with df_sistema to bring descriptions
         df_contrib = df_contrib.merge(df_sistema[['VARIAVEL', 'DESC']], on='VARIAVEL', how='left')
         df_contrib.rename(columns={'DESCRIÇÃO': 'DESC'}, inplace=True)

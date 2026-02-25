@@ -568,7 +568,7 @@ class MSCVAE:
                 'scores': all_scores
             }
 
-    def contribution(self, df_test, df_sistema, batch_size=32):
+def contribution(self, df_test, df_sistema, batch_size=32):
         if self.model is None:
             raise ValueError("Model not trained. Call .fit() first.")
         
@@ -637,8 +637,19 @@ class MSCVAE:
         df_contrib = pd.merge(df_contrib, df_sistema[['VARIAVEL', 'DESC']], on='VARIAVEL', how='left')
         # Fill in any nulls if a variable from df_test is not in df_sistema
         df_contrib['DESC'] = df_contrib['DESC'].fillna('Sem descrição')
+        
         # Sort from highest contribution to lowest
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
+        
+        # Calculate cumulative percentage
+        df_contrib['cum_perc'] = df_contrib['%'].cumsum()
+        # Condition 1: Keep variables until cumulative contribution reaches 80%
+        mask_cum_80 = df_contrib['cum_perc'].shift(fill_value=0) < 80
+        # Condition 2: Keep variables that contribute at least 5% individually
+        mask_min_5 = df_contrib['%'] >= 5
+        # Keep variables that satisfy either condition
+        df_contrib = df_contrib[mask_cum_80 & mask_min_5].drop(columns=['cum_perc']).reset_index(drop=True)
+
         # Format for the nested dictionary (keys as strings '0', '1', '2'...)
         df_contrib.index = df_contrib.index.astype(str)
         # Reorganize the column order
