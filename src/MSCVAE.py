@@ -198,12 +198,34 @@ class MSCVAE_Hybrid(nn.Module):
 
         return recon_matrix, recon_values, mu, logvar
 
-    def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=1):
-        MSE_Mat = F.mse_loss(recon_matrix, x_matrix, reduction='sum')
-        MSE_Val = F.mse_loss(recon_values, x_values, reduction='sum')
-        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    # def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=1):
+    #     MSE_Mat = F.mse_loss(recon_matrix, x_matrix, reduction='sum')
+    #     MSE_Val = F.mse_loss(recon_values, x_values, reduction='sum')
+    #     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         
-        return MSE_Mat + (alpha * MSE_Val) + KLD
+    #     return MSE_Mat + (alpha * MSE_Val) + KLD
+
+    def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=1.0):
+        # Use mean to ensure the error does not depend on the number of elements (N vs N^2)
+        mse_mat_mean = F.mse_loss(recon_matrix, x_matrix, reduction='mean')
+        mse_val_mean = F.mse_loss(recon_values, x_values, reduction='mean')
+        
+        # To not break the classic VAE balance against KLD (which is a latent sum),
+        # multiply the mean error by the total original size of the main input (N * N)
+        # This simulates the original reduction='sum' but now applying the same base scale for both
+        n_elements_matrix = x_matrix.shape[2] * x_matrix.shape[3] # N * N
+        
+        MSE_Mat_scaled = mse_mat_mean * n_elements_matrix
+        MSE_Val_scaled = mse_val_mean * n_elements_matrix # Artificial scale to equalize weight
+        
+        # KLD (sum over latent dimensions)
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        # Alpha: 
+        # alpha=1 means exactly equal weight; alpha=0.5 means matrix is worth double.
+        total_loss = MSE_Mat_scaled + (alpha * MSE_Val_scaled) + KLD
+        
+        return total_loss
 
 class SPOT:
     def __init__(self, q=1e-4):
