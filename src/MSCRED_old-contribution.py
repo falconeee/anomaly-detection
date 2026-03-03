@@ -479,7 +479,7 @@ class MSCRED:
         print(f"Threshold: {self.threshold}")
         
     def _get_train_scores(self, X_train, y_train):
-        dataset = HybridDataset(X_train.astype(np.float64), y_train.astype(np.float64))
+        dataset = HybridDataset(X_train.astype(np.float32), y_train.astype(np.float32))
         loader = DataLoader(dataset, batch_size=32, shuffle=False)
         all_scores = []
         with torch.no_grad():
@@ -529,7 +529,7 @@ class MSCRED:
         
         X_test_final, _ = self._prepare_hybrid_data(X_test, df_test)
         
-        dataset = HybridDataset(X_test_final.astype(np.float64), np.zeros((len(X_test_final), self.sensor_n))) # Dummy targets
+        dataset = HybridDataset(X_test_final.astype(np.float32), np.zeros((len(X_test_final), self.sensor_n))) # Dummy targets
         loader = DataLoader(dataset, batch_size=self.model_config['batch_size'], shuffle=False)
         
         self.model.eval()
@@ -553,18 +553,18 @@ class MSCRED:
         min_len = min(len(final_scores), len(valid_timestamps))
         
         return {
-            'timestamp': valid_timestamps[:min_len],
-            'phi': final_scores[:min_len]
+            'timestamps': valid_timestamps[:min_len],
+            'scores': final_scores[:min_len]
         }
 
-    def contribution(self, df_test, df_sistema, timestamps=None):
+def contribution(self, df_test, df_sistema):
         if self.model is None:
             raise ValueError("Model not trained.")
             
         X_test = self._generate_signature_matrix(df_test)
         X_test_final, y_test_final = self._prepare_hybrid_data(X_test, df_test)
         
-        dataset = HybridDataset(X_test_final.astype(np.float64), y_test_final.astype(np.float64))
+        dataset = HybridDataset(X_test_final.astype(np.float32), y_test_final.astype(np.float32))
         loader = DataLoader(dataset, batch_size=32, shuffle=False)
         
         total_error_matrix = np.zeros((self.sensor_n, self.sensor_n), dtype=np.float64)
@@ -605,42 +605,24 @@ class MSCRED:
         # Sort from highest to lowest contribution
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
         
-        # Base noise Filter
-        # If all sensors contributed equally, what would be the %?
-        # Cut all that contribute less than the average (i.e., are just normal noise)
-        uniform_thresh = 100.0 / self.sensor_n
-        df_valid = df_contrib[df_contrib['%'] > uniform_thresh]
-        
-        # Elbow Method
-        # Find the point of maximum relative drop between one sensor and the next in the ordered list
-        cut_index = 0
-        if len(df_valid) > 1:
-            drops = df_valid['%'].diff(-1).abs() 
-            cut_index = drops.idxmax()
-            
-        # Ensure minimum of 3 variables
-        # Compare the ideal cut with 3 and take the maximum. 
-        # Use min() to avoid errors if the entire system has less than 3 sensors.
-        vars_to_keep = max(3, cut_index + 1)
-        vars_to_keep = min(vars_to_keep, len(df_contrib))
-        
-        # Apply the cut to the original dataframe
-        df_contrib = df_contrib.iloc[:vars_to_keep].copy()
-        
-        # Rescaling %
-        # Create a new column indicating the fault participation only within this selected group
-        df_contrib['%_Relativo'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
+        # Calculate cumulative percentage
+        df_contrib['cum_perc'] = df_contrib['%'].cumsum()
+        # Condition 1: Keep variables until cumulative contribution reaches 80%
+        mask_cum_80 = df_contrib['cum_perc'].shift(fill_value=0) < 80
+        # Condition 2: Keep variables that contribute at least 5% individually
+        mask_min_5 = df_contrib['%'] >= 5
+        # Keep variables that satisfy either condition
+        df_contrib = df_contrib[mask_cum_80 | mask_min_5].drop(columns=['cum_perc']).reset_index(drop=True)
 
         # Merge with df_sistema to bring descriptions
-        df_contrib = df_contrib.merge(df_sistema[['VARIAVEL', 'DESC', 'SISTEMA']], on='VARIAVEL', how='left')
-        df_contrib.rename(columns={'DESC': 'DESC', 'SISTEMA': 'SISTEMA'}, inplace=True)
+        df_contrib = df_contrib.merge(df_sistema[['VARIAVEL', 'DESC']], on='VARIAVEL', how='left')
+        df_contrib.rename(columns={'DESCRIÇÃO': 'DESC'}, inplace=True)
         # Handle cases where a variable may not have a description in df_sistema
-        df_contrib['DESC'] = df_contrib['DESC'].fillna('NoDesc')
-        df_contrib['SISTEMA'] = df_contrib['SISTEMA'].fillna('NoSystem')
+        df_contrib['DESC'] = df_contrib['DESC'].fillna('Descrição indisponível')
         # Convert index to string to generate dictionary keys in text format ('0', '1', etc)
         df_contrib.index = df_contrib.index.astype(str)
         # Convert DataFrame to nested dictionary format
-        contributions = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%', '%_Relativo']].to_dict(orient='dict')
+        contributions = df_contrib[['VARIAVEL', 'DESC', 'score', '%']].to_dict(orient='dict')
 
         # Reconstruct DataFrame
         # Inverse transform
@@ -654,33 +636,6 @@ class MSCRED:
         # Val = Norm * (Max-Min) + Min
         recon_real = recon_arr * (max_val.T - min_val.T) + min_val.T
         
-        # Temporal alignment
-        if timestamps is not None:
-            gap_time = self.model_config['gap_time']
-            win_size = self.model_config['win_size']
-            step_max = self.model_config['step_max']
-            
-            start_gap_steps = (win_size[-1] // gap_time) + step_max
-            start_index_real = start_gap_steps * gap_time
-            
-            if hasattr(timestamps, 'values'):
-                ts_values = timestamps.values
-            else:
-                ts_values = np.array(timestamps)
-                
-            # Slice from the moment the model starts generating valid predictions
-            valid_timestamps = ts_values[start_index_real :: gap_time]
-            
-            # Safety guarantee against rounding errors in size
-            min_len = min(len(recon_real), len(valid_timestamps))
-            recon_real = recon_real[:min_len]
-            valid_timestamps = valid_timestamps[:min_len]
-            
-            df_reconstruction = pd.DataFrame(recon_real, columns=df_test.columns, index=valid_timestamps)
-            df_reconstruction.index.name = 'timestamp'
-            df_reconstruction.reset_index(inplace=True)
-        else:
-            # Fallback case if the function is called without timestamps
-            df_reconstruction = pd.DataFrame(recon_real, columns=df_test.columns)
-            
+        df_reconstruction = pd.DataFrame(recon_real, columns=df_test.columns)
+        
         return contributions, df_reconstruction

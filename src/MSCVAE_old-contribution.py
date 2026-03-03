@@ -559,16 +559,16 @@ class MSCVAE:
             final_scores = final_scores[:len(final_timestamps)]
             
             return {
-                'timestamp': final_timestamps,
-                'phi': final_scores
+                'timestamps': final_timestamps,
+                'scores': final_scores
             }
         else:
             return {
-                'timestamp': np.arange(len(all_scores)), # Dummy timestamps
-                'phi': all_scores
+                'timestamps': np.arange(len(all_scores)), # Dummy timestamps
+                'scores': all_scores
             }
 
-    def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32):
+def contribution(self, df_test, df_sistema, batch_size=32):
         if self.model is None:
             raise ValueError("Model not trained. Call .fit() first.")
         
@@ -581,9 +581,10 @@ class MSCVAE:
             raise ValueError(f"Generation error: {e}")
             
         if tensor_matrices.nelement() == 0:
-            raise ValueError("No matrices generated from input dataframe.")
+             raise ValueError("No matrices generated from input dataframe.")
 
         # Loaders
+        # Need both matrices (for error calc) and values (for reconstruction calc)
         loader = DataLoader(TensorDataset(tensor_matrices, tensor_values), batch_size=batch_size, shuffle=False)
         
         n_features = tensor_matrices.shape[2]
@@ -603,7 +604,9 @@ class MSCVAE:
                 
                 recon_matrix, recon_val, _, _ = self.model(inputs)
                 
-                # Matrix Error Calculation
+                # Contribution Calculation
+                # Matrix Error: (B, N, N)
+                # squeeze(1) removes channel dim if present (B, 1, N, N) -> (B, N, N)
                 if inputs.dim() == 4:
                     diff = inputs - recon_matrix
                     batch_error = torch.pow(diff, 2).squeeze(1)
@@ -616,7 +619,6 @@ class MSCVAE:
                 original_vals.extend(vals.cpu().numpy())
                 reconstructed_vals.extend(recon_val.cpu().numpy())
 
-        # Contributions
         variable_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
         variable_names = df_test.columns
         total_period_error = np.sum(variable_scores)
@@ -632,49 +634,32 @@ class MSCVAE:
         })
         
         # Merge with df_sistema to bring the DESC column
-        df_contrib = pd.merge(df_contrib, df_sistema[['VARIAVEL', 'DESC', 'SISTEMA']], on='VARIAVEL', how='left')
-        
+        df_contrib = pd.merge(df_contrib, df_sistema[['VARIAVEL', 'DESC']], on='VARIAVEL', how='left')
         # Fill in any nulls if a variable from df_test is not in df_sistema
-        df_contrib['DESC'] = df_contrib['DESC'].fillna('NoDesc')
-        df_contrib['SISTEMA'] = df_contrib['SISTEMA'].fillna('NoSystem')
+        df_contrib['DESC'] = df_contrib['DESC'].fillna('Sem descrição')
         
         # Sort from highest contribution to lowest
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
         
-        # Base noise Filter
-        uniform_thresh = 100.0 / n_features
-        df_valid = df_contrib[df_contrib['%'] > uniform_thresh]
-        
-        # Elbow Method
-        cut_index = 0
-        if len(df_valid) > 1:
-            drops = df_valid['%'].diff(-1).abs() 
-            cut_index = drops.idxmax()
-            
-        # Ensure minimum of 3 variables
-        vars_to_keep = max(3, cut_index + 1)
-        vars_to_keep = min(vars_to_keep, len(df_contrib))
-        
-        # Apply the cut to the original dataframe
-        df_contrib = df_contrib.iloc[:vars_to_keep].copy()
-        
-        # Rescaling %
-        # Create a new column indicating the fault participation only within this selected group
-        if df_contrib['score'].sum() > 0:
-            df_contrib['%_Relativo'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
-        else:
-            df_contrib['%_Relativo'] = 0.0
+        # Calculate cumulative percentage
+        df_contrib['cum_perc'] = df_contrib['%'].cumsum()
+        # Condition 1: Keep variables until cumulative contribution reaches 80%
+        mask_cum_80 = df_contrib['cum_perc'].shift(fill_value=0) < 80
+        # Condition 2: Keep variables that contribute at least 5% individually
+        mask_min_5 = df_contrib['%'] >= 5
+        # Keep variables that satisfy either condition
+        df_contrib = df_contrib[mask_cum_80 & mask_min_5].drop(columns=['cum_perc']).reset_index(drop=True)
 
         # Format for the nested dictionary (keys as strings '0', '1', '2'...)
         df_contrib.index = df_contrib.index.astype(str)
-        
         # Reorganize the column order
-        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%', '%_Relativo']]
-        
+        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'score', '%']]
         # Convert to the nested dictionary
         contributions_dict = df_contrib.to_dict()
 
+        # Process Reconstructions
         recon_arr = np.array(reconstructed_vals)
+
         # Create DataFrame with Original/Reconstructed columns
         recon_data = {}
         for i, col in enumerate(variable_names):
@@ -686,38 +671,5 @@ class MSCVAE:
             recon_data[f"{col}"] = rec_real
             
         reconstruction_df = pd.DataFrame(recon_data)
-        
-        # Align the DataFrame with timestamps
-        if timestamps is not None:
-            w = self.generator.w
-            s = self.generator.step
-            
-            if hasattr(timestamps, 'values'):
-                ts_values = timestamps.values
-            else:
-                ts_values = np.array(timestamps)
-                
-            # The generator iterates with 't' being the exclusive end of the window. 
-            # The reconstructed data is at index 't-1'
-            valid_indices = [t - 1 for t in range(w, len(df_test) + 1, s)]
-            
-            # Truncate by the smallest length to avoid misalignment
-            min_len = min(len(reconstruction_df), len(valid_indices))
-            reconstruction_df = reconstruction_df.iloc[:min_len].copy()
-            valid_indices = valid_indices[:min_len]
-            
-            # Align the timestamps
-            aligned_timestamps = []
-            for idx in valid_indices:
-                if idx < len(ts_values):
-                    aligned_timestamps.append(ts_values[idx])
-                else:
-                    if len(aligned_timestamps) > 0:
-                        aligned_timestamps.append(aligned_timestamps[-1])
-            
-            # Define the index and add the timestamp column
-            reconstruction_df.index = aligned_timestamps
-            reconstruction_df.index.name = 'timestamp'
-            reconstruction_df.reset_index(inplace=True)
         
         return contributions_dict, reconstruction_df
