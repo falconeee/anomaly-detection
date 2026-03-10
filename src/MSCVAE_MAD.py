@@ -198,13 +198,6 @@ class MSCVAE_Hybrid(nn.Module):
 
         return recon_matrix, recon_values, mu, logvar
 
-    # def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=1):
-    #     MSE_Mat = F.mse_loss(recon_matrix, x_matrix, reduction='sum')
-    #     MSE_Val = F.mse_loss(recon_values, x_values, reduction='sum')
-    #     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        
-    #     return MSE_Mat + (alpha * MSE_Val) + KLD
-
     def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=1.0):
         # Use mean to ensure the error does not depend on the number of elements (N vs N^2)
         mse_mat_mean = F.mse_loss(recon_matrix, x_matrix, reduction='mean')
@@ -669,20 +662,33 @@ class MSCVAE:
         
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
-        # Dynamic Identification
-        uniform_thresh = 100.0 / n_features
-        df_valid = df_contrib[df_contrib['%'] > uniform_thresh]
+        # ==========================================
+        # Dynamic Identification: MAD Approach
+        # ==========================================
+        # Backup completo caso o filtro seja muito severo
+        df_contrib_backup = df_contrib.copy()
         
-        # Elbow Method
-        cut_index = 0
-        if len(df_valid) > 1:
-            drops = df_valid['%'].diff(-1).abs() 
-            cut_index = drops.idxmax()
-            
-        vars_to_keep = max(3, cut_index + 1)
-        vars_to_keep = min(vars_to_keep, len(df_contrib))
+        # Calcula a mediana dos scores
+        median_score = df_contrib['score'].median()
         
-        df_contrib = df_contrib.iloc[:vars_to_keep].copy()
+        # Calcula o desvio absoluto em relação à mediana (MAD)
+        mad = (df_contrib['score'] - median_score).abs().median()
+        
+        # Fator de escala padrão para consistência com desvio padrão normal
+        k = 1.4826
+        
+        # Limiar: consideramos anomalia aquilo que está 3 "desvios robustos" acima da mediana
+        mad_threshold = median_score + (3 * k * mad)
+        
+        # Filtra as variáveis isolando apenas os outliers matemáticos
+        df_contrib = df_contrib[df_contrib['score'] > mad_threshold].copy()
+        
+        # Salvaguarda: se nenhum sensor ultrapassar a barreira (anomalia muito sutil),
+        # garantimos o retorno do sensor com o maior erro (topo da lista ordenada)
+        if len(df_contrib) == 0:
+            df_contrib = df_contrib_backup.head(3).copy()
+
+        # ==========================================
 
         # Recalculate the relative weight within the anomalous subgroup
         if df_contrib['score'].sum() > 0:
