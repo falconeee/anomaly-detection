@@ -198,13 +198,6 @@ class MSCVAE_Hybrid(nn.Module):
 
         return recon_matrix, recon_values, mu, logvar
 
-    # def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=1):
-    #     MSE_Mat = F.mse_loss(recon_matrix, x_matrix, reduction='sum')
-    #     MSE_Val = F.mse_loss(recon_values, x_values, reduction='sum')
-    #     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        
-    #     return MSE_Mat + (alpha * MSE_Val) + KLD
-
     def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=1.0):
         # Use mean to ensure the error does not depend on the number of elements (N vs N^2)
         mse_mat_mean = F.mse_loss(recon_matrix, x_matrix, reduction='mean')
@@ -497,6 +490,7 @@ class MSCVAE:
             print(f"Base Threshold (POT): {self.threshold:.6f}")
             print(f"Gain: {self.gain}")
             print(f"Final Threshold: {self.threshold * self.gain:.6f}")
+        self.threshold = self.threshold * self.gain
 
     def _get_anomaly_scores(self, data_tensor, batch_size=128):
         self.model.eval()

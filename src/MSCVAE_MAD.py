@@ -490,6 +490,7 @@ class MSCVAE:
             print(f"Base Threshold (POT): {self.threshold:.6f}")
             print(f"Gain: {self.gain}")
             print(f"Final Threshold: {self.threshold * self.gain:.6f}")
+        self.threshold = self.threshold * self.gain
 
     def _get_anomaly_scores(self, data_tensor, batch_size=128):
         self.model.eval()
