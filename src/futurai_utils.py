@@ -350,12 +350,6 @@ def graph_predict(phi, eixo_x, threshold, process_id, start_date, end_date, freq
 
     df["threshold"] = threshold
 
-    # Criar o DataFrame df_t2 com as colunas 'time' e 'phi'
-    df_t2 = pd.DataFrame({
-        "time": df["timestamp"],  # Usando a coluna de timestamps
-        "phi": df["phi"]  # Usando os valores de phi da predição
-    })
-
     # Criar o gráfico
     layout = go.Layout(plot_bgcolor="white")
     fig = go.Figure(layout=layout)
@@ -426,4 +420,4 @@ def graph_predict(phi, eixo_x, threshold, process_id, start_date, end_date, freq
 
     fig.update_xaxes(range=[start_date, end_date])
 
-    return fig, df_t2
+    return fig

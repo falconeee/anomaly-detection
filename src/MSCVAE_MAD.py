@@ -391,7 +391,7 @@ class SPOT:
 
 
 # Main Class
-class MSCVAE:
+class MSCVAE_MAD:
     def __init__(self, n_features=None, window_size=10, stride=1, device=None, seed=42):
         self.seed = seed
         self.set_deterministic(self.seed)
