@@ -590,7 +590,7 @@ class MSCVAE:
         
         self.model.eval()
         
-        # Generate data
+        # Gerar dados
         try:
             tensor_matrices, tensor_values = self.generator.generate(df_test)
         except ValueError as e:
@@ -600,57 +600,63 @@ class MSCVAE:
             raise ValueError("No matrices generated from input dataframe.")
 
         loader = DataLoader(TensorDataset(tensor_matrices, tensor_values), batch_size=batch_size, shuffle=False)
-        
         n_features = tensor_matrices.shape[2]
         
-        # Error accumulators
-        total_error_matrix = torch.zeros(n_features, n_features).to(self.device)
-        total_error_val = torch.zeros(n_features).to(self.device)
+        # Acumulador de Saliência (Gradientes)
+        total_saliency = torch.zeros(n_features).to(self.device)
         
         original_vals = []
         reconstructed_vals = []
         
-        with torch.no_grad():
+        # IMPORTANTE: NÃO usar torch.no_grad() aqui, pois precisamos do backpropagation
+        for batch_mat, batch_val in loader:
             self.model.h_state = None
             self.model.c_state = None
             self.model.history = []
             
-            for batch_mat, batch_val in loader:
-                inputs = batch_mat.to(self.device).float()
-                vals = batch_val.to(self.device).float()
+            inputs = batch_mat.to(self.device).float()
+            vals = batch_val.to(self.device).float()
+            
+            # Habilitar o cálculo de gradiente para a entrada
+            inputs.requires_grad_(True)
+            
+            # Forward Pass
+            recon_matrix, recon_val, mu, logvar = self.model(inputs)
+            
+            # Calcular a Loss (Score de Anomalia do Batch)
+            loss = self.model.loss_function(recon_matrix, inputs, recon_val, vals, mu, logvar, alpha)
+            
+            # Zerar gradientes anteriores
+            self.model.zero_grad()
+            if inputs.grad is not None:
+                inputs.grad.zero_()
                 
-                recon_matrix, recon_val, _, _ = self.model(inputs)
-                
-                # Matrix Error
-                if inputs.dim() == 4:
-                    diff_mat = inputs - recon_matrix
-                    batch_error_mat = torch.pow(diff_mat, 2).squeeze(1)
-                else:
-                    batch_error_mat = torch.pow(inputs - recon_matrix, 2)
-                    
-                total_error_matrix += torch.sum(batch_error_mat, dim=0)
-                
-                # Value Error
-                batch_error_val = torch.pow(vals - recon_val, 2)
-                total_error_val += torch.sum(batch_error_val, dim=0)
-                
-                # Storage
-                original_vals.extend(vals.cpu().numpy())
-                reconstructed_vals.extend(recon_val.cpu().numpy())
+            # Backward Pass: O segredo está aqui (calcula a derivada da Loss em relação à matriz de entrada)
+            loss.backward()
+            
+            # Calcular o Saliency Map: |Gradiente * Entrada|
+            # A multiplicação pela entrada escala a sensibilidade pela magnitude real do sinal
+            saliency_matrix = (inputs.grad * inputs.detach()).abs().squeeze(1)# Shape: (B, N, N)
+            
+            # A contribuição da variável 'i' é a soma das suas interações (linha ou coluna 'i' da matriz de saliência)
+            batch_saliency = torch.sum(saliency_matrix, dim=2) # Shape: (B, N)
+            
+            # Acumular a saliência de todo o batch
+            total_saliency += torch.sum(batch_saliency, dim=0)
+            
+            # Armazenar reconstruções (usando .detach() para evitar vazar memória do grafo de gradientes)
+            original_vals.extend(vals.detach().cpu().numpy())
+            reconstructed_vals.extend(recon_val.detach().cpu().numpy())
 
-        # Process Contributions
-        mat_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
-        val_scores = total_error_val.cpu().numpy()
-        
-        val_scores_scaled = val_scores * n_features
-        variable_scores = mat_scores + (alpha * val_scores_scaled)
-        
+        # ==========================================
+        # Processamento das Contribuições
+        # ==========================================
+        variable_scores = total_saliency.cpu().numpy()
         variable_names = df_test.columns
-        total_period_error = np.sum(variable_scores)
         
+        total_period_error = np.sum(variable_scores)
         contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
 
-        # Montagem do DataFrame direto com as colunas finais desejadas
         df_contrib = pd.DataFrame({
             'VARIAVEL': variable_names,
             'score': variable_scores,
@@ -664,47 +670,34 @@ class MSCVAE:
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
         # ==========================================
-        # Dynamic Identification: MAD Approach
+        # Identificação Dinâmica: MAD Approach
         # ==========================================
-        # Backup completo caso o filtro seja muito severo
         df_contrib_backup = df_contrib.copy()
         
-        # Calcula a mediana dos scores
         median_score = df_contrib['score'].median()
-        
-        # Calcula o desvio absoluto em relação à mediana (MAD)
         mad = (df_contrib['score'] - median_score).abs().median()
         
-        # Fator de escala padrão para consistência com desvio padrão normal
         k = 1.4826
+        mad_threshold = median_score + (3 * k * mad)
         
-        # Limiar: consideramos anomalia aquilo que está 3 "desvios robustos" acima da mediana
-        mad_threshold = median_score + (2.5 * k * mad)
-        
-        # Filtra as variáveis isolando apenas os outliers matemáticos
         df_contrib = df_contrib[df_contrib['score'] > mad_threshold].copy()
         
-        # Salvaguarda: se nenhum sensor ultrapassar a barreira (anomalia muito sutil),
-        # garantimos o retorno do sensor com o maior erro (topo da lista ordenada)
         if len(df_contrib) == 0:
             df_contrib = df_contrib_backup.head(3).copy()
 
-        # ==========================================
-
-        # Recalculate the relative weight within the anomalous subgroup
         if df_contrib['score'].sum() > 0:
             df_contrib['%_Relativo'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
         else:
             df_contrib['%_Relativo'] = 0.0
 
         df_contrib.index = df_contrib.index.astype(str)
-        
-        # Filtra estritamente as colunas solicitadas
         df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%', '%_Relativo']]
         
         contributions_dict = df_contrib.to_dict()
 
-        # Reconstructions
+        # ==========================================
+        # Reconstruções (com alinhamento temporal)
+        # ==========================================
         recon_arr = np.array(reconstructed_vals)
         recon_data = {}
         for i, col in enumerate(variable_names):

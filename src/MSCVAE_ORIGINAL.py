@@ -584,7 +584,7 @@ class MSCVAE:
                 'phi': all_scores
             }
 
-    def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32, alpha=1.0):
+    def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32):
         if self.model is None:
             raise ValueError("Model not trained. Call .fit() first.")
         
@@ -599,13 +599,11 @@ class MSCVAE:
         if tensor_matrices.nelement() == 0:
             raise ValueError("No matrices generated from input dataframe.")
 
+        # Loaders
         loader = DataLoader(TensorDataset(tensor_matrices, tensor_values), batch_size=batch_size, shuffle=False)
         
         n_features = tensor_matrices.shape[2]
-        
-        # Error accumulators
         total_error_matrix = torch.zeros(n_features, n_features).to(self.device)
-        total_error_val = torch.zeros(n_features).to(self.device)
         
         original_vals = []
         reconstructed_vals = []
@@ -616,105 +614,72 @@ class MSCVAE:
             self.model.history = []
             
             for batch_mat, batch_val in loader:
-                inputs = batch_mat.to(self.device).float()
-                vals = batch_val.to(self.device).float()
+                inputs = batch_mat.to(self.device)
+                vals = batch_val.to(self.device)
                 
                 recon_matrix, recon_val, _, _ = self.model(inputs)
                 
-                # Matrix Error
+                # Matrix Error Calculation
                 if inputs.dim() == 4:
-                    diff_mat = inputs - recon_matrix
-                    batch_error_mat = torch.pow(diff_mat, 2).squeeze(1)
+                    diff = inputs - recon_matrix
+                    batch_error = torch.pow(diff, 2).squeeze(1)
                 else:
-                    batch_error_mat = torch.pow(inputs - recon_matrix, 2)
+                    batch_error = torch.pow(inputs - recon_matrix, 2)
                     
-                total_error_matrix += torch.sum(batch_error_mat, dim=0)
+                total_error_matrix += torch.sum(batch_error, dim=0)
                 
-                # Value Error
-                batch_error_val = torch.pow(vals - recon_val, 2)
-                total_error_val += torch.sum(batch_error_val, dim=0)
-                
-                # Storage
+                # Reconstruction Storage
                 original_vals.extend(vals.cpu().numpy())
                 reconstructed_vals.extend(recon_val.cpu().numpy())
 
-        # Process Contributions
-        mat_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
-        val_scores = total_error_val.cpu().numpy()
-        
-        val_scores_scaled = val_scores * n_features
-        variable_scores = mat_scores + (alpha * val_scores_scaled)
-        
+        # Contributions
+        variable_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
         variable_names = df_test.columns
         total_period_error = np.sum(variable_scores)
         
+        # Safe division
         contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
 
-        # Montagem do DataFrame direto com as colunas finais desejadas
+        # Create temporary DataFrame with calculated scores
         df_contrib = pd.DataFrame({
             'VARIAVEL': variable_names,
             'score': variable_scores,
             '%': contrib_pct
         })
         
+        # Merge with df_sistema to bring the DESC column
         df_contrib = pd.merge(df_contrib, df_sistema[['VARIAVEL', 'DESC', 'SISTEMA']], on='VARIAVEL', how='left')
+        
+        # Fill in any nulls if a variable from df_test is not in df_sistema
         df_contrib['DESC'] = df_contrib['DESC'].fillna('NoDesc')
         df_contrib['SISTEMA'] = df_contrib['SISTEMA'].fillna('NoSystem')
         
+        # Sort from highest contribution to lowest
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
-
-        # ==========================================
-        # Dynamic Identification: MAD Approach
-        # ==========================================
-        # Backup completo caso o filtro seja muito severo
-        df_contrib_backup = df_contrib.copy()
         
-        # Calcula a mediana dos scores
-        median_score = df_contrib['score'].median()
-        
-        # Calcula o desvio absoluto em relação à mediana (MAD)
-        mad = (df_contrib['score'] - median_score).abs().median()
-        
-        # Fator de escala padrão para consistência com desvio padrão normal
-        k = 1.4826
-        
-        # Limiar: consideramos anomalia aquilo que está 3 "desvios robustos" acima da mediana
-        mad_threshold = median_score + (2.5 * k * mad)
-        
-        # Filtra as variáveis isolando apenas os outliers matemáticos
-        df_contrib = df_contrib[df_contrib['score'] > mad_threshold].copy()
-        
-        # Salvaguarda: se nenhum sensor ultrapassar a barreira (anomalia muito sutil),
-        # garantimos o retorno do sensor com o maior erro (topo da lista ordenada)
-        if len(df_contrib) == 0:
-            df_contrib = df_contrib_backup.head(3).copy()
-
-        # ==========================================
-
-        # Recalculate the relative weight within the anomalous subgroup
-        if df_contrib['score'].sum() > 0:
-            df_contrib['%_Relativo'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
-        else:
-            df_contrib['%_Relativo'] = 0.0
-
+        # Format for the nested dictionary (keys as strings '0', '1', '2'...)
         df_contrib.index = df_contrib.index.astype(str)
         
-        # Filtra estritamente as colunas solicitadas
-        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%', '%_Relativo']]
+        # Reorganize the column order
+        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%']]
         
+        # Convert to the nested dictionary
         contributions_dict = df_contrib.to_dict()
 
-        # Reconstructions
         recon_arr = np.array(reconstructed_vals)
+        # Create DataFrame with Original/Reconstructed columns
         recon_data = {}
         for i, col in enumerate(variable_names):
             mean = self.generator.mean[col]
             std = self.generator.std[col]
+            
+            # Denormalize
             rec_real = (recon_arr[:, i] * std) + mean
             recon_data[f"{col}"] = rec_real
             
         reconstruction_df = pd.DataFrame(recon_data)
         
+        # Align the DataFrame with timestamps
         if timestamps is not None:
             w = self.generator.w
             s = self.generator.step
@@ -724,11 +689,16 @@ class MSCVAE:
             else:
                 ts_values = np.array(timestamps)
                 
+            # The generator iterates with 't' being the exclusive end of the window. 
+            # The reconstructed data is at index 't-1'
             valid_indices = [t - 1 for t in range(w, len(df_test) + 1, s)]
+            
+            # Truncate by the smallest length to avoid misalignment
             min_len = min(len(reconstruction_df), len(valid_indices))
             reconstruction_df = reconstruction_df.iloc[:min_len].copy()
             valid_indices = valid_indices[:min_len]
             
+            # Align the timestamps
             aligned_timestamps = []
             for idx in valid_indices:
                 if idx < len(ts_values):
@@ -737,6 +707,7 @@ class MSCVAE:
                     if len(aligned_timestamps) > 0:
                         aligned_timestamps.append(aligned_timestamps[-1])
             
+            # Define the index and add the timestamp column
             reconstruction_df.index = aligned_timestamps
             reconstruction_df.index.name = 'timestamp'
             reconstruction_df.reset_index(inplace=True)
