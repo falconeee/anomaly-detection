@@ -811,7 +811,7 @@ class MSCVAE:
                 'phi': all_scores
             }
 
-def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32, alpha=1.0):
+    def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32, alpha=1.0):
         """
         Root Cause Analysis (RCA) pipeline.
         Identifies exactly which sensors caused the anomaly by measuring 
