@@ -12,27 +12,38 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # Helper Classes
 class AttributeMatrixGenerator:
+    """
+    Transforms raw multivariate time-series into spatial-temporal correlation matrices 
+    and target values for the Hybrid MSCVAE model.
+    """
     def __init__(self, window_size=10, step=10):
-        self.w = window_size
-        self.step = step
+        self.w = window_size # Time steps captured in a single matrix (temporal context)
+        self.step = step     # Sliding window stride (step=w means no overlap)
         self.mean = None
         self.std = None
 
     def fit_scaler(self, train_dataframes):
+        """
+        Calculates the mean and standard deviation from the training data.
+        These statistics are used to normalize the data (Z-score) before generating matrices.
+        """
         if isinstance(train_dataframes, pd.DataFrame):
             train_dataframes = [train_dataframes]
-        # Concat to calculate global statistics
+            
+        # Concat to calculate global statistics (mean, std)
+        # Z-score normalization is crucial so features with larger magnitudes do not dominate the dot product calculations.
         full_train_df = pd.concat(train_dataframes, ignore_index=True)
         self.mean = full_train_df.mean()
-        self.std = full_train_df.std() + 1e-6
+        self.std = full_train_df.std() + 1e-6 # Added epsilon to prevent division by zero
 
     def generate(self, df):
         if self.mean is None:
-            raise ValueError("Execute .fit_scaler() primeiro.")
+            raise ValueError("Execute .fit_scaler() first!")
 
-        # Scaling
+        # Scaling data to mean=0, std=1
         data = (df - self.mean) / self.std
-        values = np.nan_to_num(data.values)
+        # NaNs become 0 (which is the mean after scaling), preserving matrix stability
+        values = np.nan_to_num(data.values) 
         
         matrices = []
         target_values = [] 
@@ -41,14 +52,19 @@ class AttributeMatrixGenerator:
             # Return empty tuple if df is too small (i.e. smaller than window_size)
             return torch.empty(0), torch.empty(0)
 
+        # Sliding window extraction
         for t in range(self.w, len(values), self.step):
-            x_segment = values[t-self.w : t] 
+            x_segment = values[t-self.w : t] # Shape: (window_size, n_features)
             
-            # Matrix (Eq. 1)
-            x_t = torch.tensor(x_segment, dtype=torch.float32).T
-            m_t = torch.matmul(x_t, x_t.T) / self.w
+            # Matrix (Eq. 1 from paper) - Spatial-temporal inner product
+            # Captures correlations between all pairs of sensors within the window
+            # Kernel Trick can be applied here but the model already has a non-linear decoder and the anomaly detection get less sensitive.
+            x_t = torch.tensor(x_segment, dtype=torch.float32).T # Shape: (n_features, window_size)
+            m_t = torch.matmul(x_t, x_t.T) / self.w              # Shape: (n_features, n_features)
             matrices.append(m_t)
             
+            # Extracts the exact raw values of the last timestamp in the window.
+            # Used as the ground truth for the Hybrid MLP val_decoder.
             last_val = torch.tensor(x_segment[-1], dtype=torch.float32)
             target_values.append(last_val)
             
@@ -56,37 +72,63 @@ class AttributeMatrixGenerator:
             return torch.empty(0), torch.empty(0)
 
         # Tuple: (Tensor of Matrices, Tensor of Values)
+        # unsqueeze(1) adds a 'Channel' dimension (B, 1, N, N) required by PyTorch Conv2d layers.
         return torch.stack(matrices).unsqueeze(1), torch.stack(target_values)
 
 class TemporalAttention(nn.Module):
+    """
+    Applies dot-product attention across time. 
+    Purpose: Mitigates the "forgetting" issue of LSTMs by allowing the model to 
+    dynamically assign higher weights to relevant past historical states (windows) 
+    when making the current prediction, capturing long-range dependencies.
+    """
     def __init__(self, hidden_dim):
         super(TemporalAttention, self).__init__()
-        self.scale = 5.0 # Attention mechanism (how many windows the algorithm looks at to perform the current prediction)
+        # Scaling factor for dot-product attention. Prevents extremely large 
+        # values before softmax, which would cause vanishing gradients.
+        self.scale = 5.0 
 
     def forward(self, h_current, h_history):
         if not h_history:
             return h_current
         
+        # Stack history into a single tensor: (History_Length, B, C, H, W)
         context = torch.stack(h_history, dim=0)
         b, c, h, w = h_current.size()
-        flat_curr = h_current.view(b, -1).unsqueeze(1) 
-        flat_hist = context.view(context.size(0), b, -1).permute(1, 2, 0) 
         
+        # Flatten spatial dimensions to compute similarity scores via matrix multiplication
+        flat_curr = h_current.view(b, -1).unsqueeze(1) # Shape: (B, 1, C*H*W)
+        flat_hist = context.view(context.size(0), b, -1).permute(1, 2, 0) # Shape: (B, C*H*W, History_Length)
+        
+        # Calculate similarity scores between the current state and all past states
         scores = torch.bmm(flat_curr, flat_hist) / self.scale 
+        # Normalize scores into probability weights (0 to 1)
         weights = F.softmax(scores, dim=-1) 
         
+        # Compute the context vector as a weighted sum of the historical states
         weighted_hist = torch.bmm(weights, flat_hist.permute(0, 2, 1))
+        
+        # Reshape back to original spatial dimensions (B, C, H, W)
         h_hat = weighted_hist.view(b, c, h, w)
         
         return h_hat
 
 class ConvLSTMCell(nn.Module):
+    """
+    Convolutional LSTM cell.
+    Purpose: Replaces fully-connected linear layers of a standard LSTM with 2D Convolutions.
+    This is crucial because it preserves the 2D spatial structure (the sensor-to-sensor 
+    correlations in the matrix) while simultaneously learning temporal dynamics.
+    """
     def __init__(self, input_dim, hidden_dim, kernel_size, bias):
         super(ConvLSTMCell, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        # Padding ensures the output spatial dimensions (H, W) match the input
         self.padding = kernel_size // 2
         
+        # A single convolution layer calculates all 4 LSTM gates at once for efficiency.
+        # The output channel size is 4 * hidden_dim to account for i, f, o, and g gates.
         self.conv = nn.Conv2d(in_channels=input_dim + hidden_dim,
                               out_channels=4 * hidden_dim,
                               kernel_size=kernel_size,
@@ -95,63 +137,103 @@ class ConvLSTMCell(nn.Module):
 
     def forward(self, input_tensor, cur_state):
         h_cur, c_cur = cur_state
+        
+        # Concatenate current input matrix and previous hidden state along the channel dimension
         combined = torch.cat([input_tensor, h_cur], dim=1)
+        
+        # Apply convolution to generate raw gate values
         combined_conv = self.conv(combined)
+        
+        # Split the convolved output into the 4 distinct LSTM gates
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
         
-        i = torch.sigmoid(cc_i)
-        f = torch.sigmoid(cc_f)
-        o = torch.sigmoid(cc_o)
-        g = torch.tanh(cc_g)
+        # Apply non-linearities: Sigmoid for gates (0 to 1), Tanh for candidate states (-1 to 1)
+        i = torch.sigmoid(cc_i) # Input gate: what new info to keep
+        f = torch.sigmoid(cc_f) # Forget gate: what old info to discard
+        o = torch.sigmoid(cc_o) # Output gate: what to output
+        g = torch.tanh(cc_g)    # Cell candidate: new potential memory
         
+        # Update cell state (c_next) and hidden state (h_next)
         c_next = f * c_cur + i * g
         h_next = o * torch.tanh(c_next)
+        
         return h_next, c_next
 
 class MSCVAE_Hybrid(nn.Module):
+    """
+    Multivariate Spatial-Temporal Convolutional Variational Autoencoder (Hybrid).
+    Architecture:
+    1. CNN Encoder: Compresses spatial correlation matrices into a latent space.
+    2. VAE Core (mu, logvar): Learns a continuous normal distribution of the normal system state.
+    3. ConvLSTM + Attention: Captures the temporal evolution (inertia) of the compressed states.
+    4. Dual Decoder (Hybrid mechanism): 
+       - Route 1 (MLP): Reconstructs exact raw values (sensitive to extreme peaks).
+       - Route 2 (CNN): Reconstructs correlation matrices (sensitive to relationship breaks).
+    """
     def __init__(self, n_features):
         super(MSCVAE_Hybrid, self).__init__()
         self.n_features = n_features
-        latent_dim=round(math.sqrt(n_features))
+        # Latent dimension scaled by the square root of features to prevent over-compression
+        latent_dim = round(math.sqrt(n_features))
         
-        # Encoder
+        # Encoder: Extracts hierarchical spatial features from the correlation matrix
         self.enc1 = nn.Conv2d(1, 16, 3, 2, 1)
         self.enc2 = nn.Conv2d(16, 32, 3, 2, 1)
         self.enc3 = nn.Conv2d(32, 64, 3, 2, 1)
         
-        # Dummy pass
+        # Dummy pass: Automatically calculates the flattened dimension size after convolutions.
+        # This makes the architecture dynamic and adaptable to any number of sensors (n_features).
         with torch.no_grad():
             dummy = torch.zeros(1, 1, n_features, n_features)
             out = self.enc3(self.enc2(self.enc1(dummy)))
             self.flatten_dim = out.view(1, -1).size(1)
             self.spatial_shape = out.shape[1:] 
 
-        # Latent
+        # Latent Space (VAE Core)
+        # Projects the flattened CNN features into probabilistic mean and variance vectors
         self.fc_mu = nn.Linear(self.flatten_dim, latent_dim)
         self.fc_logvar = nn.Linear(self.flatten_dim, latent_dim)
         
-        # Decoder Matrix
+        # Decoder Matrix: Projects the latent vector back to the spatial shape required by ConvTranspose2d
         self.fc_decode_mat = nn.Linear(latent_dim, self.flatten_dim)
         
         # Decoder of Values (Hybrid)
+        # MLP network designed to reconstruct raw sensor values by combining the static 
+        # latent representation (z) with temporal memory (h_att).
+        # GELU activation is used to prevent the "Dying ReLU" problem, allowing smooth 
+        # gradients for negative Z-score normalized values.
+        # BatchNorm1d stabilizes training and accelerates convergence for continuous regression tasks.
+        val_input_dim = latent_dim + self.flatten_dim
         self.val_decoder = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, n_features) 
+            nn.Linear(val_input_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Linear(256, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Linear(512, n_features) 
         )
 
         # Temporal Modeling
+        # ConvLSTM retains the 2D spatial correlations while learning temporal dependencies.
+        # TemporalAttention weighs the importance of the last 5 time steps (max_history).
         self.clstm = ConvLSTMCell(64, 64, kernel_size=3, bias=True)
         self.attention = TemporalAttention(hidden_dim=64)
         
-        # Convolutional Decoder
+        # Convolutional Decoder: Upsamples the combined (Z + Temporal) features back to the original N x N matrix size
         self.dec3 = nn.ConvTranspose2d(64, 32, 3, 2, 1, output_padding=1)
         self.dec2 = nn.ConvTranspose2d(32, 16, 3, 2, 1, output_padding=1)
         self.dec1 = nn.ConvTranspose2d(16, 1, 3, 2, 1, output_padding=1)
         
+        # State initialization for temporal modules
         self.h_state = None; self.c_state = None; self.history = []; self.max_history = 5
 
     def reparameterize(self, mu, logvar):
+        """
+        Reparameterization Trick: Allows backpropagation through the stochastic sampling process.
+        During training, it adds Gaussian noise (std) to the mean (mu).
+        During evaluation (eval), it acts deterministically returning only the mean, stabilizing anomaly scores.
+        """
         if self.training:
             std = torch.exp(0.5 * logvar)
             return mu + torch.randn_like(std) * std
@@ -161,67 +243,94 @@ class MSCVAE_Hybrid(nn.Module):
     def forward(self, x):
         batch_size = x.size(0)
         
-        # Encoder
+        # Encode
         e3 = F.relu(self.enc3(F.relu(self.enc2(F.relu(self.enc1(x))))))
         flat = e3.view(batch_size, -1)
         mu = self.fc_mu(flat)
         logvar = self.fc_logvar(flat)
         z = self.reparameterize(mu, logvar)
         
-        # Route 1: Values
-        recon_values = self.val_decoder(z)
-        
-        # Route 2: Matrices
+        # Temporal Modeling
+        # Initialize hidden states if it's a new batch sequence
         if self.h_state is None or self.h_state.size(0) != batch_size:
             h, w = self.spatial_shape[1], self.spatial_shape[2]
             self.h_state = torch.zeros(batch_size, 64, h, w).to(x.device)
             self.c_state = torch.zeros(batch_size, 64, h, w).to(x.device)
             self.history = []
 
+        # Pass encoded spatial features through ConvLSTM and Attention
         h_next, c_next = self.clstm(e3, (self.h_state, self.c_state))
         h_att = self.attention(h_next, self.history)
         
+        # Detach states to truncate Backpropagation Through Time (BPTT) and save memory
         self.h_state = h_att.detach()
         self.c_state = c_next.detach()
         self.history.append(self.h_state)
         if len(self.history) > self.max_history: self.history.pop(0)
 
+        # Route 1: Raw Values (Hybrid Decoding)
+        # Reconstructs values by observing both current correlation (z) and historical context (h_att)
+        flat_h_att = h_att.view(batch_size, -1) 
+        z_temporal = torch.cat([z, flat_h_att], dim=1) 
+        recon_values = self.val_decoder(z_temporal)
+        
+        # Route 2: Matrices (Standard Decoding)
+        # Reconstructs matrix by adding current latent projection to the historical attention map
         z_dec = self.fc_decode_mat(z).view(batch_size, *self.spatial_shape)
-        combined = z_dec + h_att
+        combined = z_dec + h_att 
         
         d3 = F.relu(self.dec3(combined))
         d2 = F.relu(self.dec2(d3))
         recon_matrix = self.dec1(d2)
         
+        # Bilinear interpolation ensures output matches exact input dimensions (N x N)
+        # necessary if N is odd or max-pooling layers lost dimension parity.
         if recon_matrix.shape != x.shape:
             recon_matrix = F.interpolate(recon_matrix, size=x.shape[2:], mode='bilinear', align_corners=False)
 
         return recon_matrix, recon_values, mu, logvar
 
-    def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=1.0):
-        # Use mean to ensure the error does not depend on the number of elements (N vs N^2)
+    def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=5.0, beta=0.6):
+        """
+        Multitask Loss Function (Beta-VAE framework).
+        """
+        # Calculate base mean squared errors
         mse_mat_mean = F.mse_loss(recon_matrix, x_matrix, reduction='mean')
         mse_val_mean = F.mse_loss(recon_values, x_values, reduction='mean')
         
-        # To not break the classic VAE balance against KLD (which is a latent sum),
-        # multiply the mean error by the total original size of the main input (N * N)
-        # This simulates the original reduction='sum' but now applying the same base scale for both
-        n_elements_matrix = x_matrix.shape[2] * x_matrix.shape[3] # N * N
+        # Dimensionality Balancing: 
+        # A matrix has N*N elements, while the value vector has only N.
+        # Multiplying the 'mean' error by N*N simulates a 'sum' reduction, ensuring that the
+        # magnitude of the reconstruction loss is mathematically aligned with the KLD (which uses sum).
+        n_elements_matrix = x_matrix.shape[2] * x_matrix.shape[3] 
         
         MSE_Mat_scaled = mse_mat_mean * n_elements_matrix
-        MSE_Val_scaled = mse_val_mean * n_elements_matrix # Artificial scale to equalize weight
+        MSE_Val_scaled = mse_val_mean * n_elements_matrix 
         
-        # KLD (sum over latent dimensions)
+        # KLD (Kullback-Leibler Divergence) acts as a regularizer, forcing the latent space 
+        # to approximate a standard normal distribution. Prevents overfitting.
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-        # Alpha: 
-        # alpha=1 means exactly equal weight; alpha=0.5 means matrix is worth double.
-        total_loss = MSE_Mat_scaled + (alpha * MSE_Val_scaled) + KLD
+        # Total Loss Calculation:
+        # alpha: Weighs the importance of reconstructing raw values vs matrices (Hybrid balance).
+        # beta: Controls the strength of the KLD regularizer (Beta-VAE technique). Lower beta (<1) 
+        # prevents 'Posterior Collapse', giving the model more freedom to focus on reconstruction accuracy.
+        total_loss = MSE_Mat_scaled + (alpha * MSE_Val_scaled) + (beta * KLD)
         
         return total_loss
 
 class SPOT:
+    """
+    Streaming Peaks-Over-Threshold (SPOT) Algorithm.
+    Purpose: Dynamically calculates anomaly thresholds based on Extreme Value Theory (EVT).
+    Instead of assuming a normal (Gaussian) distribution of errors, SPOT models the 
+    'tail' of the distribution (the extreme reconstruction errors) using a Generalized 
+    Pareto Distribution (GPD). This allows for robust, mathematically sound thresholding 
+    that adapts to non-linear and heavy-tailed error distributions typical in VAEs.
+    """
     def __init__(self, q=1e-4):
+        # q (proba): The desired probability of false alarms. A lower 'q' means a 
+        # stricter threshold, resulting in fewer anomalies being flagged.
         self.proba = q
         self.extreme_quantile = None
         self.data = None
@@ -232,6 +341,10 @@ class SPOT:
         self.Nt = 0
 
     def fit(self, init_data, data):
+        """
+        Loads the initial calibration data (from the training phase) and the 
+        data to be monitored. Handles multiple data types (list, numpy, pandas).
+        """
         if isinstance(data, list): self.data = np.array(data)
         elif isinstance(data, np.ndarray): self.data = data
         elif isinstance(data, pd.Series): self.data = data.values
@@ -249,6 +362,7 @@ class SPOT:
         else: return
 
     def add(self, data):
+        """Appends new streaming data to the existing data array."""
         if isinstance(data, list): data = np.array(data)
         elif isinstance(data, np.ndarray): data = data
         elif isinstance(data, pd.Series): data = data.values
@@ -256,27 +370,35 @@ class SPOT:
         self.data = np.append(self.data, data)
 
     def initialize(self, level=0.98, min_extrema=False, verbose=True):
+        """
+        Calibration Phase: Establishes the base parameters using normal data.
+        It sorts the initial data and sets a basic threshold (e.g., the 98th percentile).
+        Values above this are considered 'peaks' and are used to fit the GPD.
+        """
         if min_extrema:
             self.init_data = -self.init_data
             self.data = -self.data
-            level = 1 - level
+            self.level = 1 - level
         level = level - math.floor(level)
         n_init = self.init_data.size
         S = np.sort(self.init_data)
         self.init_threshold = S[int(level * n_init)]
+        
+        # 'peaks' are the extreme reconstruction errors that exceed the initial threshold
         self.peaks = self.init_data[self.init_data > self.init_threshold] - self.init_threshold
         self.Nt = self.peaks.size
         self.n = n_init
-        if verbose:
-            print('Initial threshold : %s' % self.init_threshold)
-            print('Number of peaks : %s' % self.Nt)
-            print('Grimshaw maximum log-likelihood estimation ... ', end='')
+            
+        # Fits the Generalized Pareto Distribution to the peaks
         g, s, l = self._grimshaw()
+        # Calculates the final strict threshold based on the desired false alarm probability (q)
         self.extreme_quantile = self._quantile(g, s)
+        
         if verbose:
             print('Extreme quantile (probability = %s): %s' % (self.proba, self.extreme_quantile))
 
     def _rootsFinder(fun, jac, bounds, npoints, method):
+        """Helper function for Grimshaw's trick: Finds roots of the derivative equation."""
         from scipy.optimize import minimize
         if method == 'regular':
             step = (bounds[1] - bounds[0]) / (npoints + 1)
@@ -284,6 +406,7 @@ class SPOT:
             X0 = np.arange(bounds[0] + step, bounds[1], step)
         elif method == 'random':
             X0 = np.random.uniform(bounds[0], bounds[1], npoints)
+            
         def objFun(X, f, jac):
             g = 0
             j = np.zeros(X.shape)
@@ -294,6 +417,7 @@ class SPOT:
                 j[i] = 2 * fx * jac(x)
                 i = i + 1
             return g, j
+            
         opt = minimize(lambda X: objFun(X, fun, jac), X0,
                        method='L-BFGS-B',
                        jac=True, bounds=[bounds] * len(X0))
@@ -302,6 +426,7 @@ class SPOT:
         return np.unique(X)
 
     def _log_likelihood(Y, gamma, sigma):
+        """Calculates the log-likelihood of the GPD given shape (gamma) and scale (sigma) parameters."""
         n = Y.size
         if gamma != 0:
             tau = gamma / sigma
@@ -311,6 +436,11 @@ class SPOT:
         return L
 
     def _grimshaw(self, epsilon=1e-8, n_points=10):
+        """
+        Grimshaw's Trick: An efficient algorithm to find the Maximum Likelihood Estimation (MLE) 
+        for the parameters of the Generalized Pareto Distribution (gamma and sigma) 
+        based on the observed peaks.
+        """
         def u(s): return 1 + np.log(s).mean()
         def v(s): return np.mean(1 / s)
         def w(Y, t):
@@ -323,6 +453,7 @@ class SPOT:
             jac_us = (1 / t) * (1 - vs)
             jac_vs = (1 / t) * (-vs + np.mean(1 / s ** 2))
             return us * jac_vs + vs * jac_us
+            
         Ym = self.peaks.min()
         YM = self.peaks.max()
         Ymean = self.peaks.mean()
@@ -331,6 +462,7 @@ class SPOT:
         a = a + epsilon
         b = 2 * (Ymean - Ym) / (Ymean * Ym)
         c = 2 * (Ymean - Ym) / (Ym ** 2)
+        
         left_zeros = SPOT._rootsFinder(lambda t: w(self.peaks, t),
                                        lambda t: jac_w(self.peaks, t),
                                        (a + epsilon, -epsilon),
@@ -340,9 +472,11 @@ class SPOT:
                                         (b, c),
                                         n_points, 'regular')
         zeros = np.concatenate((left_zeros, right_zeros))
+        
         gamma_best = 0
         sigma_best = Ymean
         ll_best = SPOT._log_likelihood(self.peaks, gamma_best, sigma_best)
+        
         for z in zeros:
             gamma = u(1 + z * self.peaks) - 1
             sigma = gamma / z
@@ -351,83 +485,132 @@ class SPOT:
                 gamma_best = gamma
                 sigma_best = sigma
                 ll_best = ll
+                
         return gamma_best, sigma_best, ll_best
 
     def _quantile(self, gamma, sigma):
+        """
+        Computes the final anomaly threshold (extreme quantile) using the fitted GPD parameters 
+        and the predefined false alarm probability (q).
+        """
         r = self.n * self.proba / self.Nt
         if gamma != 0: return self.init_threshold + (sigma / gamma) * (pow(r, -gamma) - 1)
         else: return self.init_threshold - sigma * math.log(r)
 
     def run(self, with_alarm=True, dynamic=True):
+        """
+        Streaming Inference Phase.
+        Iterates over the test data. If 'dynamic=True', the GPD parameters and the threshold 
+        are updated on-the-fly whenever a new peak (that is not an anomaly) is observed.
+        Returns a dictionary containing the dynamic thresholds and the indices of anomalies.
+        """
         if self.n > self.init_data.size:
             print('Warning : the algorithm seems to have already been run, you should initialize before running again')
             return {}
+            
         th = []
         alarm = []
+        
         for i in range(self.data.size):
             if not dynamic:
+                # Static evaluation: Threshold never updates.
                 if self.data[i] > self.init_threshold and with_alarm:
                     self.extreme_quantile = self.init_threshold
                     alarm.append(i)
             else:
+                # Dynamic evaluation: Updates the GPD distribution with new normal peaks.
                 if self.data[i] > self.extreme_quantile:
+                    # Data point exceeds the extreme quantile: It's an Anomaly.
                     if with_alarm: alarm.append(i)
                     else:
+                        # If alarms are off, treat the anomaly as a new peak and update distribution.
                         self.peaks = np.append(self.peaks, self.data[i] - self.init_threshold)
                         self.Nt += 1
                         self.n += 1
                         g, s, l = self._grimshaw()
                         self.extreme_quantile = self._quantile(g, s)
                 elif self.data[i] > self.init_threshold:
+                    # Data point is a peak but NOT an anomaly: Update the GPD to learn the new normal.
                     self.peaks = np.append(self.peaks, self.data[i] - self.init_threshold)
                     self.Nt += 1
                     self.n += 1
                     g, s, l = self._grimshaw()
                     self.extreme_quantile = self._quantile(g, s)
                 else:
+                    # Normal data point below initial threshold.
                     self.n += 1
+                    
             th.append(self.extreme_quantile)
+            
         return {'thresholds': th, 'alarms': alarm}
 
 
-# Main Class
 class MSCVAE:
+    """
+    Main wrapper class for the MSCVAE anomaly detection pipeline.
+    Purpose: Acts as the high-level API orchestrating the entire lifecycle: 
+    data preprocessing (matrix generation), model training, dynamic threshold 
+    calculation (SPOT), and root cause analysis (contribution).
+    """
     def __init__(self, n_features=None, window_size=10, stride=1, device=None, seed=42):
         self.seed = seed
+        # Enforce reproducibility right at initialization
         self.set_deterministic(self.seed)
         
         self.n_features = n_features
         self.window_size = window_size
         self.stride = stride
         
+        # Hardware selection: automatically defaults to GPU if available for faster tensor operations
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = device
             
         self.model = None
+        # Instantiates the generator that will transform flat series into spatial-temporal inputs
         self.generator = AttributeMatrixGenerator(window_size=self.window_size, step=self.stride)
+        
         self.threshold = None
-        self.gain = 1.0 # default gain
+        # Gain acts as a manual sensitivity tuner applied on top of the SPOT statistical threshold
+        self.gain = 1.0 
     
     def set_deterministic(self, seed=42):
+        """
+        Fixes random seeds across all underlying libraries (Python, NumPy, PyTorch).
+        Deep learning involves stochastic processes (weight initialization, batch shuffling).
+        Locking the seed ensures that experiments, debugging, and anomaly scores are 100% 
+        reproducible across different executions on the same machine.
+        """
         random.seed(seed)
         os.environ['PYTHONHASHSEED'] = str(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
+        
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+            torch.cuda.manual_seed_all(seed) # Ensures reproducibility in multi-GPU setups
+            
+        # Forces CuDNN to use deterministic convolution algorithms. 
+        # Prevents slight precision variations caused by underlying hardware optimizations.
         torch.backends.cudnn.deterministic = True
+        # Disables auto-tuner that searches for the fastest convolution algorithm, 
+        # prioritizing consistency over maximum speed.
         torch.backends.cudnn.benchmark = False
 
     def fit(self, train_data, epochs=50, batch_size=128, lr=1e-3, gain=1.0, verbose=True):
+        """
+        Main training orchestration pipeline.
+        Handles data preprocessing, model weight optimization, and statistical threshold calibration.
+        """
         self.gain = gain
+        # Standardize input to a list of DataFrames to support training on multiple disjoint periods
         if isinstance(train_data, pd.DataFrame):
             train_data = [train_data]
             
         # Fit scaler
         if verbose: print("Fitting scaler...")
+        # Fits Z-score scaler globally on normal data to ensure stable inner products later
         self.generator.fit_scaler(train_data)
         
         # Prepare data
@@ -435,22 +618,25 @@ class MSCVAE:
         train_matrices = []
         train_values = []
         
-        # If n_features was not set, set it from the first dataframe
+        # If n_features was not set, infer it dynamically from the dataset
         if self.n_features is None:
             self.n_features = train_data[0].shape[1]
             
         for df in train_data:
+            # Transforms flat multivariate series into spatial-temporal matrices and target values
             t_mat, t_val = self.generator.generate(df)
             if t_mat.nelement() > 0:
                 train_matrices.append(t_mat)
                 train_values.append(t_val)
         
         if not train_matrices:
-             raise ValueError("No training data generated. Check window_size and data length.")
+             raise ValueError("No training data generated. Check window_size and data length!")
 
         final_train_matrix = torch.cat(train_matrices, dim=0)
         final_train_values = torch.cat(train_values, dim=0)
         
+        # DataLoader shuffles the batches. This breaks sequence bias and ensures the VAE 
+        # learns robust global representations rather than just memorizing local trends.
         train_loader = DataLoader(
             TensorDataset(final_train_matrix, final_train_values), 
             batch_size=batch_size, 
@@ -459,9 +645,11 @@ class MSCVAE:
         
         # Initialize Model
         self.model = MSCVAE_Hybrid(n_features=self.n_features).to(self.device)
+        # Adam optimizer is used due to its adaptive learning rate, which is highly 
+        # effective for training the distinct components of a Hybrid VAE simultaneously.
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         
-        # Training
+        # Training Phase
         self.model.train()
         if verbose: print(f"Starting training on {self.device} for {epochs} epochs...")
         
@@ -471,8 +659,11 @@ class MSCVAE:
                 x_mat = batch_matrix.to(self.device)
                 x_val = batch_values.to(self.device)
                 
+                # Standard PyTorch Backprop Loop
                 optimizer.zero_grad()
                 recon_mat, recon_val, mu, logvar = self.model(x_mat)
+                
+                # Calculates multitask loss (Matrix MSE + Value MSE + KLD Regularization)
                 loss = self.model.loss_function(recon_mat, x_mat, recon_val, x_val, mu, logvar)
                 loss.backward()
                 optimizer.step()
@@ -481,59 +672,88 @@ class MSCVAE:
             if verbose and (epoch + 1) % 5 == 0:
                 print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss / len(train_loader.dataset):.4f}")
 
-        # Calculate Threshold (POT)
+        # Post-Training: Threshold Calibration (POT)
         if verbose: print("Calculating threshold...")
+        # Evaluates the model on the normal training data to establish the baseline error distribution
         train_scores = self._get_anomaly_scores(final_train_matrix)
+        
+        # Applies Extreme Value Theory (SPOT algorithm) to find the mathematical upper limit 
+        # of normal reconstruction errors, providing a strict, unsupervised alarm threshold.
         self.threshold = self._pot_eval(train_scores)
         
         if verbose:
             print(f"Base Threshold (POT): {self.threshold:.6f}")
             print(f"Gain: {self.gain}")
             print(f"Final Threshold: {self.threshold * self.gain:.6f}")
+            
+        # Gain acts as a manual sensitivity multiplier (e.g., gain=1.2 makes alarms 20% less sensitive)
         self.threshold = self.threshold * self.gain
 
     def _get_anomaly_scores(self, data_tensor, batch_size=128):
+        """
+        Calculates the raw anomaly score (phi) for each timestamp based purely on 
+        the spatial-temporal matrix reconstruction error.
+        The matrix represents the core physical relationships between sensors. 
+        If the correlation breaks, the system is fundamentally anomalous.
+        """
         self.model.eval()
+        # reduction='none' allows us to compute the error for each sample individually 
+        # instead of averaging the whole batch.
         mse_loss = nn.MSELoss(reduction='none')
         scores = []
         
-        # Create loader for internal score calculation
         loader = DataLoader(TensorDataset(data_tensor), batch_size=batch_size, shuffle=False)
         
         with torch.no_grad():
+            # Reset temporal states to prevent leakage between completely different inferences
             self.model.h_state = None
             self.model.c_state = None
             self.model.history = []
             
             for (batch_input,) in loader:
-                x = batch_input.to(self.device)
+                x = batch_input.to(self.device).float()
                 recon_mat, _, _, _ = self.model(x)
-                # Score based on matrix reconstruction
+                
+                # Sums the squared error over all channels, height, and width (dims 1, 2, 3).
+                # The result is a 1D array where each element is the total error of one temporal window.
                 loss = mse_loss(recon_mat, x).sum(dim=(1, 2, 3)).cpu().numpy()
                 scores.extend(loss)
                 
         return np.array(scores)
 
     def _pot_eval(self, init_score, q=1e-4, level=0.02):
+        """
+        Wrapper for the SPOT (Peaks-Over-Threshold) algorithm initialization.
+        Finds the exact mathematical threshold (extreme_quantile) above which 
+        a reconstruction error is considered a true anomaly, rather than just noise.
+        """
         lms = level
         while True:
             try:
                 s = SPOT(q)
                 s.fit(init_score, init_score)
+                # Attempts to fit the Pareto distribution. If the data is too smooth or 
+                # lacks distinct peaks, the Scipy optimization might fail (raise Exception).
                 s.initialize(level=lms, min_extrema=False, verbose=False)
             except Exception:
+                # Fallback mechanism: Gradually lowers the definition of what constitutes a 'peak' 
+                # until the optimization algorithm converges successfully.
                 lms = lms * 0.999
             else:
                 break
         return s.extreme_quantile
 
     def predict(self, df_test, timestamps=None, batch_size=128):
+        """
+        Inference pipeline for new unseen data.
+        Returns a dictionary mapping timestamps to their respective anomaly scores (phi).
+        """
         if self.model is None:
-            raise ValueError("Model not trained. Call .fit() first.")
+            raise ValueError("Model not trained. Call .fit() first!")
 
         self.model.eval()
         
-        # Generate data
+        # Transform raw test data into correlation matrices
         try:
             tensor_matrices, _ = self.generator.generate(df_test)
         except ValueError as e:
@@ -544,10 +764,14 @@ class MSCVAE:
             print(f"Test dataframe too small for window {self.generator.w}.")
             return {}
             
-        # Get scores using batch processing
+        # Get the raw anomaly score (reconstruction error) for each matrix
         all_scores = self._get_anomaly_scores(tensor_matrices, batch_size=batch_size)
         
         # Time Alignment
+        # The generator uses a sliding window (w) and a step size (s).
+        # This means the score calculated for matrix M_t actually represents the state 
+        # of the system at the *end* of that window. We must map the score back to the 
+        # correct original timestamp to avoid time-shift errors in production.
         w = self.generator.w
         s = self.generator.step
         
@@ -557,9 +781,12 @@ class MSCVAE:
             else:
                 ts_values = np.array(timestamps)
                 
+            # 'valid_indices' mimics the loop in the generator to find which timestamps 
+            # correspond to the end of each generated matrix.
             valid_indices = range(w, len(df_test) + 1, s)
-            min_len = min(len(all_scores), len(valid_indices))
             
+            # Truncate to the smallest length to prevent IndexError in case of minor dimension mismatches
+            min_len = min(len(all_scores), len(valid_indices))
             final_scores = all_scores[:min_len]
             final_indices = valid_indices[:min_len]
             
@@ -569,9 +796,9 @@ class MSCVAE:
                 if idx < len(ts_values):
                      final_timestamps.append(ts_values[idx])
                 elif idx == len(ts_values):
+                    # If index hits exactly the length, grab the last available timestamp
                     final_timestamps.append(ts_values[-1])
             
-            # Additional trimming if needed
             final_scores = final_scores[:len(final_timestamps)]
             
             return {
@@ -580,30 +807,35 @@ class MSCVAE:
             }
         else:
             return {
-                'timestamp': np.arange(len(all_scores)), # Dummy timestamps
+                'timestamp': np.arange(len(all_scores)), # Dummy timestamps if none provided
                 'phi': all_scores
             }
 
-    def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32, alpha=1.0):
+def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32, alpha=1.0):
+        """
+        Root Cause Analysis (RCA) pipeline.
+        Identifies exactly which sensors caused the anomaly by measuring 
+        their individual reconstruction errors. Combines spatial correlation errors 
+        (matrices) and raw magnitude errors (values) to pinpoint the failure origin.
+        """
         if self.model is None:
-            raise ValueError("Model not trained. Call .fit() first.")
+            raise ValueError("Model not trained. Call .fit() first!")
         
         self.model.eval()
         
-        # Generate data
+        # Generate spatial-temporal matrices and target values from the raw dataframe
         try:
             tensor_matrices, tensor_values = self.generator.generate(df_test)
         except ValueError as e:
             raise ValueError(f"Generation error: {e}")
             
         if tensor_matrices.nelement() == 0:
-            raise ValueError("No matrices generated from input dataframe.")
+            raise ValueError("No matrices generated from input dataframe!")
 
         loader = DataLoader(TensorDataset(tensor_matrices, tensor_values), batch_size=batch_size, shuffle=False)
-        
         n_features = tensor_matrices.shape[2]
         
-        # Error accumulators
+        # Error accumulators for each individual feature (sensor)
         total_error_matrix = torch.zeros(n_features, n_features).to(self.device)
         total_error_val = torch.zeros(n_features).to(self.device)
         
@@ -621,7 +853,8 @@ class MSCVAE:
                 
                 recon_matrix, recon_val, _, _ = self.model(inputs)
                 
-                # Matrix Error
+                # Matrix Error: Measures broken correlations. 
+                # If Sensor A breaks, its correlation with all other sensors changes.
                 if inputs.dim() == 4:
                     diff_mat = inputs - recon_matrix
                     batch_error_mat = torch.pow(diff_mat, 2).squeeze(1)
@@ -630,27 +863,30 @@ class MSCVAE:
                     
                 total_error_matrix += torch.sum(batch_error_mat, dim=0)
                 
-                # Value Error
+                # Value Error: Measures direct magnitude spikes (Hybrid mechanism)
                 batch_error_val = torch.pow(vals - recon_val, 2)
                 total_error_val += torch.sum(batch_error_val, dim=0)
                 
-                # Storage
+                # Storage for later denormalization
                 original_vals.extend(vals.cpu().numpy())
                 reconstructed_vals.extend(recon_val.cpu().numpy())
 
-        # Process Contributions
+        # Score Processing & Dimensional Balance
+        # Summing dim=1 aggregates the correlation error of sensor 'i' with all other sensors
         mat_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
         val_scores = total_error_val.cpu().numpy()
         
+        # Dimensional balance: A matrix row has N elements, the value has 1. 
+        # We multiply by N so the value error holds equal voting weight in the final score.
         val_scores_scaled = val_scores * n_features
         variable_scores = mat_scores + (alpha * val_scores_scaled)
         
-        variable_names = df_test.columns
+        variable_names = self.generator.mean.index
         total_period_error = np.sum(variable_scores)
         
         contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
 
-        # Montagem do DataFrame direto com as colunas finais desejadas
+        # Assemble the raw contribution DataFrame
         df_contrib = pd.DataFrame({
             'VARIAVEL': variable_names,
             'score': variable_scores,
@@ -663,48 +899,40 @@ class MSCVAE:
         
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
-        # ==========================================
-        # Dynamic Identification: MAD Approach
-        # ==========================================
-        # Backup completo caso o filtro seja muito severo
+        # Dynamic Identification with MAD Approach
+        # Median Absolute Deviation is robust against the "Masking Effect".
+        # If a massive anomaly occurs, classical standard deviation gets skewed, hiding the anomaly.
+        # MAD relies on the median (normal sensors), creating an unbreakable baseline.
         df_contrib_backup = df_contrib.copy()
         
-        # Calcula a mediana dos scores
         median_score = df_contrib['score'].median()
-        
-        # Calcula o desvio absoluto em relação à mediana (MAD)
         mad = (df_contrib['score'] - median_score).abs().median()
         
-        # Fator de escala padrão para consistência com desvio padrão normal
+        # Standard scale factor (k=1.4826) makes MAD comparable to a normal standard deviation.
         k = 1.4826
+        # Dynamic threshold: Only isolates sensors mathematically behaving as extreme outliers
+        mad_threshold = median_score + (k * mad)
         
-        # Limiar: consideramos anomalia aquilo que está 3 "desvios robustos" acima da mediana
-        mad_threshold = median_score + (2.5 * k * mad)
-        
-        # Filtra as variáveis isolando apenas os outliers matemáticos
         df_contrib = df_contrib[df_contrib['score'] > mad_threshold].copy()
         
-        # Salvaguarda: se nenhum sensor ultrapassar a barreira (anomalia muito sutil),
-        # garantimos o retorno do sensor com o maior erro (topo da lista ordenada)
+        # Fallback: If the anomaly is too subtle for the MAD threshold, force return the top 3 culprits
         if len(df_contrib) == 0:
             df_contrib = df_contrib_backup.head(3).copy()
 
-        # ==========================================
-
-        # Recalculate the relative weight within the anomalous subgroup
+        # Final Formatting & Reconstructions
+        # Recalculate relative weights strictly within the isolated anomalous subgroup
         if df_contrib['score'].sum() > 0:
-            df_contrib['%_Relativo'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
+            df_contrib['%'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
         else:
-            df_contrib['%_Relativo'] = 0.0
+            df_contrib['%'] = 0.0
 
         df_contrib.index = df_contrib.index.astype(str)
-        
-        # Filtra estritamente as colunas solicitadas
-        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%', '%_Relativo']]
+        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%']]
         
         contributions_dict = df_contrib.to_dict()
 
-        # Reconstructions
+        # Denormalize reconstructed values (apply Z-score backwards) so they can be 
+        # plotted alongside the real physical values in a dashboard.
         recon_arr = np.array(reconstructed_vals)
         recon_data = {}
         for i, col in enumerate(variable_names):
@@ -715,6 +943,7 @@ class MSCVAE:
             
         reconstruction_df = pd.DataFrame(recon_data)
         
+        # Align sliding window predictions back to their exact original timestamps
         if timestamps is not None:
             w = self.generator.w
             s = self.generator.step
