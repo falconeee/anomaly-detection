@@ -3,6 +3,7 @@ import numpy as np
 import math
 import random
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -654,6 +655,7 @@ class MSCVAE:
         if verbose: print(f"Starting training on {self.device} for {epochs} epochs...")
         
         for epoch in range(epochs):
+            epoch_start_time = time.time()
             total_loss = 0
             for batch_matrix, batch_values in train_loader:
                 x_mat = batch_matrix.to(self.device)
@@ -668,9 +670,10 @@ class MSCVAE:
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-            
-            if verbose and (epoch + 1) % 5 == 0:
-                print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss / len(train_loader.dataset):.4f}")
+            epoch_duration = time.time() - epoch_start_time
+
+            if verbose and (epoch == 0 or epoch == epochs - 1 or (epoch + 1) % 5 == 0):
+                print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss / len(train_loader.dataset):.4f} | Time: {epoch_duration:.2f}s")
 
         # Post-Training: Threshold Calibration (POT)
         if verbose: print("Calculating threshold...")
