@@ -114,13 +114,13 @@ class TemporalAttention(nn.Module):
         context = torch.sum(hidden_states * weights, dim=1)
         return context
 
-class MSCRED(nn.Module):
+class MSCRED_hybrid(nn.Module):
     """
     Hybrid Multivariate Spatial-Temporal Convolutional Recurrent Network.
     Simultaneously reconstructs sensor correlation matrices and raw magnitude values.
     """
     def __init__(self, sensor_n, scale_n, step_max):
-        super(MSCRED, self).__init__()
+        super(MSCRED_hybrid, self).__init__()
         self.sensor_n = sensor_n
         
         # Spatial Encoder: Extracts features from multi-scale correlation matrices
@@ -574,7 +574,7 @@ class MSCRED:
         scale_n = sample_shape[2]
         self.sensor_n = sample_shape[3]
         
-        self.model = MSCRED(sensor_n=self.sensor_n, scale_n=scale_n, step_max=self.model_config['step_max']).to(self.device)
+        self.model = MSCRED_hybrid(sensor_n=self.sensor_n, scale_n=scale_n, step_max=self.model_config['step_max']).to(self.device)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.model_config['learning_rate'])
         criterion = nn.MSELoss()
         

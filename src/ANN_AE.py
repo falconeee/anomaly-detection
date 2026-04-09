@@ -206,13 +206,40 @@ class ANN_AE:
 
     def fit(self, df_train, epochs=100, batch_size=128, lr=1e-3, patience=20, val_split=0.1, gain=1.0):
         self.gain = gain
-        self.n_features = df_train.shape[1]
-        self.feature_names = df_train.columns.tolist() if isinstance(df_train, pd.DataFrame) else [f"Var_{i}" for i in range(self.n_features)]
         
-        data_scaled = self.scaler.fit_transform(df_train.values)
-        windows = self._reshape_data(data_scaled)
-        tensor_data = torch.tensor(windows, dtype=torch.float32)
+        # 1. Padroniza a entrada para ser sempre uma lista
+        if isinstance(df_train, pd.DataFrame) or isinstance(df_train, np.ndarray):
+            df_train = [df_train]
+            
+        # 2. Extrai metadados do primeiro dataframe
+        first_df = df_train[0]
+        self.n_features = first_df.shape[1]
+        self.feature_names = first_df.columns.tolist() if isinstance(first_df, pd.DataFrame) else [f"Var_{i}" for i in range(self.n_features)]
         
+        # 3. Treina o Scaler globalmente com todos os dados
+        if isinstance(first_df, pd.DataFrame):
+            full_data = pd.concat(df_train, ignore_index=True).values
+        else:
+            full_data = np.vstack(df_train)
+        self.scaler.fit(full_data)
+        
+        # 4. Escala e gera janelas isoladamente para cada período
+        all_windows = []
+        for df in df_train:
+            vals = df.values if isinstance(df, pd.DataFrame) else df
+            data_scaled = self.scaler.transform(vals)
+            windows = self._reshape_data(data_scaled)
+            if len(windows) > 0:
+                all_windows.append(windows)
+                
+        if not all_windows:
+            raise ValueError("Os dataframes são menores que o seq_len. Nenhuma janela foi gerada.")
+            
+        # Concatena as janelas finais
+        final_windows = np.concatenate(all_windows, axis=0)
+        tensor_data = torch.tensor(final_windows, dtype=torch.float32)
+        
+        # 5. Restante do pipeline permanece inalterado
         split_idx = int((1 - val_split) * len(tensor_data))
         train_loader = DataLoader(TensorDataset(tensor_data[:split_idx]), batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(TensorDataset(tensor_data[split_idx:]), batch_size=batch_size, shuffle=False)
@@ -269,26 +296,69 @@ class ANN_AE:
         self.threshold = base_threshold * self.gain
         print(f"Limiar de Anomalia Final (SPOT * Gain): {self.threshold:.6f}")
 
-    def predict(self, df_test, timestamps, batch_size=128):
-        if self.model is None: raise ValueError("Execute .fit() primeiro.")
-            
-        data_scaled = self.scaler.transform(df_test.values)
-        windows = self._reshape_data(data_scaled)
-        if len(windows) == 0: return pd.DataFrame()
-            
-        all_losses = self._get_anomaly_scores(torch.tensor(windows, dtype=torch.float32), batch_size)
+    def predict(self, df_test, timestamps=None, batch_size=128):
+        """
+        Inference pipeline for new unseen data.
+        Returns a dictionary mapping timestamps to their respective anomaly scores (loss) and classification.
+        """
+        if self.model is None:
+            raise ValueError("O modelo não foi treinado. Execute .fit() primeiro.")
+
+        self.model.eval()
         
-        ts_values = timestamps.values if hasattr(timestamps, 'values') else np.array(timestamps)
-        valid_timestamps = ts_values[self.seq_len - 1 :: self.stride]
-        min_len = min(len(all_losses), len(valid_timestamps))
+        # Transformação dos dados de teste
+        try:
+            data_scaled = self.scaler.transform(df_test.values)
+            windows = self._reshape_data(data_scaled)
+        except Exception as e:
+            print(f"Erro na transformação dos dados: {e}")
+            return {}
+            
+        if len(windows) == 0:
+            print(f"Dataframe de teste muito pequeno para a janela de tamanho {self.seq_len}.")
+            return {}
+            
+        # Obtém o score de anomalia (erro de reconstrução absoluto/MSE)
+        tensor_windows = torch.tensor(windows, dtype=torch.float32)
+        all_scores = self._get_anomaly_scores(tensor_windows, batch_size=batch_size)
         
-        df_resultado = pd.DataFrame({
-            'timestamp': valid_timestamps[:min_len],
-            'loss': all_losses[:min_len],
-            'is_anomaly': np.array(all_losses[:min_len]) > self.threshold
-        })
-        df_resultado.set_index('timestamp', inplace=True)
-        return df_resultado
+        # Alinhamento Temporal (Time Alignment)
+        # O score calculado representa o estado do sistema no *final* daquela janela.
+        w = self.seq_len
+        s = self.stride
+        
+        if timestamps is not None:
+            ts_values = timestamps.values if hasattr(timestamps, 'values') else np.array(timestamps)
+                
+            # Mapeia os índices correspondentes ao último timestamp de cada janela gerada
+            valid_indices = [i + w - 1 for i in range(0, len(df_test) - w + 1, s)]
+            
+            # Trunca para evitar IndexError em caso de divergências de dimensão
+            min_len = min(len(all_scores), len(valid_indices))
+            final_scores = all_scores[:min_len]
+            final_indices = valid_indices[:min_len]
+            
+            final_timestamps = []
+            for idx in final_indices:
+                # Proteção básica para index fora dos limites
+                if idx < len(ts_values):
+                     final_timestamps.append(ts_values[idx])
+                elif idx == len(ts_values):
+                    # Se bater exatamente no limite, pega o último timestamp disponível
+                    final_timestamps.append(ts_values[-1])
+            
+            final_scores = final_scores[:len(final_timestamps)]
+            
+            return {
+                'timestamp': final_timestamps,
+                'phi': final_scores.tolist()
+            }
+        else:
+            # Timestamps fictícios caso nenhum seja fornecido
+            return {
+                'timestamp': np.arange(len(all_scores)).tolist(),
+                'phi': all_scores.tolist()
+            }
 
     def contribution(self, df_anomaly, timestamps=None, df_sistema=None, batch_size=32):
         """
