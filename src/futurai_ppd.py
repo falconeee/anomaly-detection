@@ -395,7 +395,8 @@ def set_tags_config(df_dataset, dir_file_tags):
 def load_dataset_principal(
     dir_file, list_columns_drop, timestamp, dropna=False, use_chunks=False, chunksize=1000, sep=";", decimal=".", mask="%Y-%m-%d %H:%M:%S"
 ):
-    if use_chunks:
+    is_parquet = str(dir_file).endswith(".parquet")
+    if use_chunks and not is_parquet:
         # Importação do arquivo CSV em chunks
         chunks = pd.read_csv(dir_file, sep=sep, decimal=decimal, chunksize=chunksize) #engine="pyarrow"
         processed_chunks = []
@@ -421,8 +422,11 @@ def load_dataset_principal(
         
         df_aux = pd.concat(processed_chunks)
     else:
-        # Importação do arquivo CSV completo
-        df_aux = pd.read_csv(dir_file, sep=sep, decimal=decimal, engine="pyarrow")
+        # Importação do arquivo completo (Parquet não precisa de chunks)
+        if is_parquet:
+            df_aux = pd.read_parquet(dir_file)
+        else:
+            df_aux = pd.read_csv(dir_file, sep=sep, decimal=decimal, engine="pyarrow")
         
         # Remover colunas especificadas
         df_aux = df_aux.drop(columns=list_columns_drop, axis=1, errors="ignore")
