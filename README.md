@@ -4,11 +4,10 @@ Detecção de anomalias não supervisionada em séries temporais multivariadas d
 processos industriais (bombas, ventiladores, motores etc.), com análise de causa
 raiz por variável.
 
-O repositório reúne oito modelos de deep learning e um baseline estatístico
-(PCA), todos com a mesma interface `fit` / `predict` / `contribution`. O limiar
-de anomalia é calculado automaticamente via **SPOT** (Teoria de Valores
-Extremos). Assim, os modelos podem ser comparados lado a lado sobre os mesmos
-dados de processo.
+O repositório reúne oito modelos de deep learning, todos com a mesma interface
+`fit` / `predict` / `contribution`. O limiar de anomalia é calculado
+automaticamente via **SPOT** (Teoria de Valores Extremos). Assim, os modelos
+podem ser comparados lado a lado sobre os mesmos dados de processo.
 
 ## Modelos
 
@@ -22,9 +21,8 @@ dados de processo.
 | **ANN_AE** | `src/models/ANN_AE.py` | Autoencoder denso (MLP) sobre janelas deslizantes | — |
 | **CNN_AE** | `src/models/CNN_AE.py` | Autoencoder convolucional 1D | — |
 | **LSTM_AE** | `src/models/LSTM_AE.py` | Autoencoder LSTM | — |
-| **FuturaiML** | `src/futurai_ml.py` | PCA com estatísticas T² de Hotelling e Q (SPE) combinadas em φ | Baseline estatístico |
 
-O limiar de todos os modelos de deep learning vem do **SPOT** (Siffer et al.,
+O limiar de todos os modelos vem do **SPOT** (Siffer et al.,
 KDD 2017). Ele ajusta uma distribuição Generalizada de Pareto à cauda dos erros
 de reconstrução no treino. O parâmetro `gain` multiplica esse limiar para
 ajustar a sensibilidade manualmente.
@@ -35,9 +33,8 @@ ajustar a sensibilidade manualmente.
 anomaly-detection/
 ├── src/
 │   ├── models/            # Os 8 modelos de deep learning
-│   ├── futurai_ppd.py     # Pré-processamento: carga, ON/OFF, transitórios, NaN, tags
-│   ├── futurai_utils.py   # Gráficos (Plotly) e seleção de período de treino (PCA/T²)
-│   └── futurai_ml.py      # Baseline PCA (T² + Q)
+│   ├── preprocessing.py   # Pré-processamento: carga, ON/OFF, transitórios, NaN, tags
+│   └── utils.py           # Gráficos (Plotly)
 ├── examples/              # Notebooks de aplicação em ativos reais
 │   ├── bomba_392P2007.ipynb
 │   ├── bomba_392P2048-49.ipynb
@@ -87,8 +84,8 @@ por subsistema na análise de contribuição.
 O fluxo típico (é o que os notebooks em `examples/` fazem) é:
 
 ```python
-import src.futurai_ppd as ppd
-import src.futurai_utils as utils
+import src.preprocessing as ppd
+import src.utils as utils
 from src.models.MSCVAE import MSCVAE
 
 timestamp = "Timestamp"
@@ -136,7 +133,7 @@ Os hiperparâmetros de arquitetura (`seq_len`, `latent_dim`, `window_sizes`
 etc.) ficam no construtor de cada classe, e todos aceitam `seed` (padrão 42)
 para reprodutibilidade.
 
-### Pré-processamento (`futurai_ppd`)
+### Pré-processamento (`src/preprocessing.py`)
 
 | Função | Para quê |
 |---|---|
@@ -146,10 +143,8 @@ para reprodutibilidade.
 | `select_periods_nan` | Lista os períodos sem dados, para sombrear nos gráficos |
 | `merge_periods` | Une intervalos sobrepostos |
 
-### Visualização (`futurai_utils`)
+### Visualização (`src/utils.py`)
 
-- `select_training_period`: gráfico de T² (PCA) do histórico para escolher
-  visualmente os períodos de operação normal.
 - `graph_predict`: série de `phi` contra o limiar, com períodos de anomalia destacados.
 - `graph_variables`: séries originais × reconstruídas por variável.
 
