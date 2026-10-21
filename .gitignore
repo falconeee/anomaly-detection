@@ -1,4 +1,16 @@
+# Dados de processo (não versionados)
 data/
+
+# Ambientes virtuais
 venv/
-__pycache__/
 .venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store

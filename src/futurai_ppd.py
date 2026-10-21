@@ -402,7 +402,7 @@ def load_dataset_principal(
         processed_chunks = []
         for chunk in chunks:
             # Remover colunas especificadas
-            chunk = chunk.drop(columns=list_columns_drop, axis=1, errors="ignore")
+            chunk = chunk.drop(columns=list_columns_drop, errors="ignore")
             
             # Conversão da coluna de timestamp para Datetime object
             chunk[timestamp] = pd.to_datetime(chunk[timestamp],format=mask)
@@ -429,7 +429,7 @@ def load_dataset_principal(
             df_aux = pd.read_csv(dir_file, sep=sep, decimal=decimal, engine="pyarrow")
         
         # Remover colunas especificadas
-        df_aux = df_aux.drop(columns=list_columns_drop, axis=1, errors="ignore")
+        df_aux = df_aux.drop(columns=list_columns_drop, errors="ignore")
 
         # Conversão da coluna de timestamp para Datetime object
         df_aux[timestamp] = pd.to_datetime(df_aux[timestamp])
